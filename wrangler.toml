@@ -5,3 +5,7 @@ compatibility_date = "2024-02-08"
 [vars]
 # Public variables only
 ENVIRONMENT = "production"
+
+[[kv_namespaces]]
+binding = "CLANKA_STATE"
+id = "39b3f694feb347fa84dcc3cd9f1861c6"
