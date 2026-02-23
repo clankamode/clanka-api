@@ -104,7 +104,8 @@ export default {
       }
 
       if (request.method === 'DELETE') {
-        const { id } = Object.fromEntries(await request.formData());
+        const body = await request.json() as any;
+        const id = body.id;
         const tasksRaw = await env.CLANKA_STATE.get("tasks") || "[]";
         let tasks = JSON.parse(tasksRaw);
         tasks = tasks.filter((t: any) => t.id !== id);
