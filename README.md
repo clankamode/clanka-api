@@ -1,82 +1,48 @@
 # clanka-api
 
-Cloudflare Worker API for presence/status and admin task management.
+`clanka-api` is the edge control API behind Clanka's public presence surface and fleet metadata. It runs as a Cloudflare Worker, persists mutable state in `CLANKA_STATE` KV, and exposes read endpoints for the site plus admin-only write paths for task/presence updates.
 
-## Authentication
+## Stack
+- Cloudflare Workers (`wrangler`)
+- TypeScript
+- Cloudflare KV (`CLANKA_STATE`)
 
-Admin endpoints require:
+## Run And Deploy
+Install dependencies:
+```bash
+npm install
+```
 
-- Header: `Authorization: Bearer <ADMIN_KEY>`
+Run locally:
+```bash
+npx wrangler dev
+```
+
+Deploy:
+```bash
+npx wrangler deploy
+```
+
+Required bindings/secrets:
+- KV binding: `CLANKA_STATE`
+- secret: `ADMIN_KEY`
+
+Set secret:
+```bash
+npx wrangler secret put ADMIN_KEY
+```
 
 ## Endpoints
+Public:
+- `GET /status` - health/status payload
+- `GET /now` - live presence payload used by the site
+- `GET /fleet/summary` - 16-repo fleet map grouped by tier and criticality
 
-### `GET /status`
-Returns service health metadata.
+Admin (`Authorization: Bearer <ADMIN_KEY>`):
+- `POST /set-presence` - set presence + optionally append activity/team/tasks
+- `GET /admin/tasks` - list tasks
+- `POST /admin/tasks` - add task
+- `PUT /admin/tasks` - update task by `id`
+- `DELETE /admin/tasks` - delete task by `id`
 
-Example response:
-
-```json
-{
-  "status": "operational",
-  "timestamp": "2026-02-23T12:34:56.000Z",
-  "signal": "⚡"
-}
-```
-
-### `GET /now`
-Returns current presence plus recent activity/team data.
-
-Example response includes:
-
-- `current`
-- `status`
-- `stack`
-- `timestamp`
-- `history`
-- `team`
-
-### `POST /set-presence`
-Sets presence and optionally updates tasks/team/history.
-
-Auth: admin required.
-
-JSON body fields:
-
-- `state` (string)
-- `message` (string)
-- `ttl` (number, seconds)
-- `activity` (object)
-- `team` (object)
-- `tasks` (array)
-
-### `GET /admin/tasks`
-Returns all tasks.
-
-Auth: admin required.
-
-### `POST /admin/tasks`
-Adds one task.
-
-Auth: admin required.
-
-JSON body: task object (stored as-is).
-
-### `PUT /admin/tasks`
-Updates a task by `id`.
-
-Auth: admin required.
-
-JSON body: object containing `id` and updated fields.
-
-### `DELETE /admin/tasks`
-Deletes a task by `id`.
-
-Auth: admin required.
-
-JSON body:
-
-```json
-{
-  "id": "task-id"
-}
-```
+Fallback root response advertises service identity and endpoint list.
