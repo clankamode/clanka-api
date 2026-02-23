@@ -3,6 +3,28 @@ export interface Env {
   ADMIN_KEY: string;
 }
 
+type FleetTier = "ops" | "infra" | "core" | "quality" | "policy" | "template";
+type FleetCriticality = "critical" | "high" | "medium";
+
+const FLEET_REGISTRY: Array<{ repo: string; criticality: FleetCriticality; tier: FleetTier }> = [
+  { repo: "clankamode/pr-signal-lens", criticality: "medium", tier: "ops" },
+  { repo: "clankamode/ci-failure-triager", criticality: "high", tier: "ops" },
+  { repo: "clankamode/ops-control-plane", criticality: "high", tier: "ops" },
+  { repo: "clankamode/meta-runner", criticality: "critical", tier: "ops" },
+  { repo: "clankamode/auto-remediator", criticality: "critical", tier: "ops" },
+  { repo: "clankamode/fleet-admin", criticality: "critical", tier: "infra" },
+  { repo: "clankamode/fleet-status-page", criticality: "high", tier: "infra" },
+  { repo: "clankamode/assistant-tool-registry", criticality: "high", tier: "infra" },
+  { repo: "clankamode/tool-fleet-policy", criticality: "high", tier: "policy" },
+  { repo: "clankamode/tool-starter", criticality: "medium", tier: "template" },
+  { repo: "clankamode/clanka-api", criticality: "high", tier: "core" },
+  { repo: "clankamode/clanka-tools", criticality: "high", tier: "core" },
+  { repo: "clankamode/clanka-core", criticality: "critical", tier: "core" },
+  { repo: "clankamode/clanka", criticality: "critical", tier: "core" },
+  { repo: "clankamode/playwright-contract-guard", criticality: "medium", tier: "quality" },
+  { repo: "clankamode/local-env-doctor", criticality: "high", tier: "quality" },
+];
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -72,6 +94,44 @@ export default {
       }), { headers: corsHeaders });
     }
 
+    if (url.pathname === "/fleet/summary") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const tiers: Record<FleetTier, string[]> = {
+        ops: [],
+        infra: [],
+        core: [],
+        quality: [],
+        policy: [],
+        template: [],
+      };
+      const byCriticality: Record<FleetCriticality, string[]> = {
+        critical: [],
+        high: [],
+        medium: [],
+      };
+
+      for (const item of FLEET_REGISTRY) {
+        tiers[item.tier].push(item.repo);
+        byCriticality[item.criticality].push(item.repo);
+      }
+
+      return new Response(
+        JSON.stringify({
+          generatedAt: new Date().toISOString(),
+          totalRepos: FLEET_REGISTRY.length,
+          tiers,
+          byCriticality,
+        }),
+        { headers: corsHeaders },
+      );
+    }
+
     // Tasks CRUD (admin only)
     if (url.pathname === "/admin/tasks") {
       const auth = request.headers.get("Authorization");
@@ -104,7 +164,8 @@ export default {
       }
 
       if (request.method === 'DELETE') {
-        const { id } = Object.fromEntries(await request.formData());
+        const body = await request.json() as any;
+        const id = body.id;
         const tasksRaw = await env.CLANKA_STATE.get("tasks") || "[]";
         let tasks = JSON.parse(tasksRaw);
         tasks = tasks.filter((t: any) => t.id !== id);
@@ -133,7 +194,7 @@ if (url.pathname === "/now") {
     return new Response(JSON.stringify({
       identity: "CLANKA_API",
       active: true,
-      endpoints: ["/status", "/now", "/tasks"]
+      endpoints: ["/status", "/now", "/admin/tasks", "/fleet/summary"]
     }), { headers: corsHeaders });
   },
 };
