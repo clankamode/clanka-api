@@ -5,8 +5,12 @@ export interface Env {
 
 type FleetTier = "ops" | "infra" | "core" | "quality" | "policy" | "template";
 type FleetCriticality = "critical" | "high" | "medium";
+type FleetRepo = { repo: string; criticality: FleetCriticality; tier: FleetTier };
+type HistoryEntry = { timestamp: number; desc: string; type: string; hash: string };
 
-const FLEET_REGISTRY: Array<{ repo: string; criticality: FleetCriticality; tier: FleetTier }> = [
+const HISTORY_LIMIT = 20;
+
+const FLEET_REGISTRY: FleetRepo[] = [
   { repo: "clankamode/pr-signal-lens", criticality: "medium", tier: "ops" },
   { repo: "clankamode/ci-failure-triager", criticality: "high", tier: "ops" },
   { repo: "clankamode/ops-control-plane", criticality: "high", tier: "ops" },
@@ -24,6 +28,67 @@ const FLEET_REGISTRY: Array<{ repo: string; criticality: FleetCriticality; tier:
   { repo: "clankamode/playwright-contract-guard", criticality: "medium", tier: "quality" },
   { repo: "clankamode/local-env-doctor", criticality: "high", tier: "quality" },
 ];
+
+function safeParseJSON<T>(value: string | null, fallback: T): T {
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function makeHistoryHash(timestamp: number): string {
+  return Math.floor(timestamp).toString(16).slice(-8);
+}
+
+function toHistoryEntry(value: unknown, fallbackTimestamp: number): HistoryEntry {
+  if (!value || typeof value !== "object") {
+    const ts = fallbackTimestamp;
+    return { timestamp: ts, desc: "activity", type: "event", hash: makeHistoryHash(ts) };
+  }
+
+  const item = value as Record<string, unknown>;
+  const tsRaw = item.timestamp;
+  const timestamp = typeof tsRaw === "number" && Number.isFinite(tsRaw) ? tsRaw : fallbackTimestamp;
+  const desc = typeof item.desc === "string"
+    ? item.desc
+    : typeof item.message === "string"
+      ? item.message
+      : "activity";
+  const type = typeof item.type === "string" ? item.type : "event";
+  const hash = typeof item.hash === "string" && item.hash.length > 0 ? item.hash : makeHistoryHash(timestamp);
+
+  return { timestamp, desc, type, hash };
+}
+
+function normalizeHistory(history: unknown): HistoryEntry[] {
+  if (!Array.isArray(history)) return [];
+  return history
+    .slice(0, HISTORY_LIMIT)
+    .map((entry, index) => toHistoryEntry(entry, Date.now() - index));
+}
+
+function countActiveAgents(team: unknown): number {
+  if (!team || typeof team !== "object") return 0;
+
+  if (Array.isArray(team)) {
+    return team.reduce((count, member) => {
+      if (member && typeof member === "object" && (member as { status?: unknown }).status === "active") {
+        return count + 1;
+      }
+      return count;
+    }, 0);
+  }
+
+  return Object.values(team as Record<string, unknown>).reduce((count, member) => {
+    if (member === "active") return count + 1;
+    if (member && typeof member === "object" && (member as { status?: unknown }).status === "active") {
+      return count + 1;
+    }
+    return count;
+  }, 0);
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -58,7 +123,14 @@ export default {
         return new Response(`Unauthorized`, { status: 401 });
       }
 
-      const { state, message, ttl, activity, team, tasks } = await request.json() as any;
+      const { state, message, ttl, activity, team, tasks } = await request.json() as {
+        state?: string;
+        message?: string;
+        ttl?: number;
+        activity?: unknown;
+        team?: Record<string, unknown>;
+        tasks?: unknown;
+      };
 
       if (tasks) {
         await env.CLANKA_STATE.put("tasks", JSON.stringify(tasks));
@@ -66,16 +138,17 @@ export default {
 
       if (team) {
         const currentTeamRaw = await env.CLANKA_STATE.get("team") || "{}";
-        const currentTeam = JSON.parse(currentTeamRaw);
+        const currentTeam = safeParseJSON<Record<string, unknown>>(currentTeamRaw, {});
         const updatedTeam = { ...currentTeam, ...team };
         await env.CLANKA_STATE.put("team", JSON.stringify(updatedTeam));
       }
 
       if (activity) {
         const historyRaw = await env.CLANKA_STATE.get("history") || "[]";
-        const history = JSON.parse(historyRaw);
-        history.unshift({ ...activity, timestamp: Date.now() });
-        await env.CLANKA_STATE.put("history", JSON.stringify(history.slice(0, 10)));
+        const history = normalizeHistory(safeParseJSON<unknown[]>(historyRaw, []));
+        const entry = toHistoryEntry(activity, Date.now());
+        history.unshift(entry);
+        await env.CLANKA_STATE.put("history", JSON.stringify(history.slice(0, HISTORY_LIMIT)));
       }
 
       if (state) {
@@ -84,6 +157,22 @@ export default {
         });
       }
       return new Response(JSON.stringify({ success: true }), { headers: corsHeaders });
+    }
+
+    if (url.pathname === "/history") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const historyRaw = await env.CLANKA_STATE.get("history") || "[]";
+      const history = normalizeHistory(safeParseJSON<unknown[]>(historyRaw, []));
+
+      return new Response(JSON.stringify({ history: history.slice(0, HISTORY_LIMIT) }), {
+        headers: corsHeaders,
+      });
     }
 
     if (url.pathname === "/status") {
@@ -125,8 +214,38 @@ export default {
         JSON.stringify({
           generatedAt: new Date().toISOString(),
           totalRepos: FLEET_REGISTRY.length,
+          repos: FLEET_REGISTRY,
           tiers,
           byCriticality,
+        }),
+        { headers: corsHeaders },
+      );
+    }
+
+    if (url.pathname === "/pulse") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const [presenceRaw, historyRaw, teamRaw] = await Promise.all([
+        env.CLANKA_STATE.get("presence"),
+        env.CLANKA_STATE.get("history"),
+        env.CLANKA_STATE.get("team"),
+      ]);
+      const presence = safeParseJSON<{ state?: string; timestamp?: number } | null>(presenceRaw, null);
+      const history = normalizeHistory(safeParseJSON<unknown[]>(historyRaw || "[]", []));
+      const team = safeParseJSON<unknown>(teamRaw || "{}", {});
+      const agentsActive = countActiveAgents(team);
+
+      return new Response(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          status: presence?.state || "active",
+          agents_active: agentsActive,
+          last_event_desc: history[0]?.desc || null,
         }),
         { headers: corsHeaders },
       );
@@ -174,27 +293,77 @@ export default {
       }
     }
 
+    if (url.pathname === "/admin/activity") {
+      const auth = request.headers.get("Authorization");
+      const expected = `Bearer ${env.ADMIN_KEY}`;
+      if (auth !== expected) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      if (request.method !== "POST") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const body = await request.json() as { desc?: unknown; type?: unknown };
+      const desc = typeof body.desc === "string" ? body.desc.trim() : "";
+      const type = typeof body.type === "string" ? body.type.trim() : "";
+      if (!desc || !type) {
+        return new Response(JSON.stringify({ error: "Invalid body" }), {
+          status: 400,
+          headers: corsHeaders,
+        });
+      }
+
+      const historyRaw = await env.CLANKA_STATE.get("history") || "[]";
+      const history = normalizeHistory(safeParseJSON<unknown[]>(historyRaw, []));
+      const entry = toHistoryEntry({ desc, type }, Date.now());
+      history.unshift(entry);
+      const nextHistory = history.slice(0, HISTORY_LIMIT);
+      await env.CLANKA_STATE.put("history", JSON.stringify(nextHistory));
+
+      return new Response(JSON.stringify({ success: true, entry }), { headers: corsHeaders });
+    }
+
     
 if (url.pathname === "/now") {
-      const presenceRaw = await env.CLANKA_STATE.get("presence");
-      const historyRaw = await env.CLANKA_STATE.get("history") || "[]";
-      const teamRaw = await env.CLANKA_STATE.get("team") || "{}";
-      const presence = presenceRaw ? JSON.parse(presenceRaw) : null;
+      const [presenceRaw, historyRaw, teamRaw, startedRaw] = await Promise.all([
+        env.CLANKA_STATE.get("presence"),
+        env.CLANKA_STATE.get("history"),
+        env.CLANKA_STATE.get("team"),
+        env.CLANKA_STATE.get("started"),
+      ]);
+      const now = Date.now();
+      const presence = safeParseJSON<{ state?: string; message?: string; timestamp?: number } | null>(presenceRaw, null);
+      const history = normalizeHistory(safeParseJSON<unknown[]>(historyRaw || "[]", []));
+      const team = safeParseJSON<unknown>(teamRaw || "{}", {});
+      let started = Number(startedRaw);
+      if (!Number.isFinite(started)) {
+        started = now;
+        await env.CLANKA_STATE.put("started", String(started));
+      }
+      const agentsActive = countActiveAgents(team);
+      const lastSeenMs = typeof presence?.timestamp === "number" ? presence.timestamp : now;
 
       return new Response(JSON.stringify({
         current: presence?.message || "monitoring workspace and building public signals",
         status: presence?.state || "active",
         stack: ["Cloudflare Workers", "TypeScript", "Lit"],
-        timestamp: presence?.timestamp || Date.now(),
-        history: JSON.parse(historyRaw),
-        team: JSON.parse(teamRaw)
+        timestamp: lastSeenMs,
+        uptime: Math.max(0, now - started),
+        agents_active: agentsActive,
+        last_seen: new Date(lastSeenMs).toISOString(),
+        history,
+        team
       }), { headers: corsHeaders });
     }
 
     return new Response(JSON.stringify({
       identity: "CLANKA_API",
       active: true,
-      endpoints: ["/status", "/now", "/admin/tasks", "/fleet/summary"]
+      endpoints: ["/status", "/now", "/history", "/pulse", "/admin/tasks", "/admin/activity", "/fleet/summary"]
     }), { headers: corsHeaders });
   },
 };
