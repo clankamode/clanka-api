@@ -3,6 +3,16 @@ export interface Env {
   ADMIN_KEY: string;
 }
 
+interface HeartbeatEntry {
+  timestamp: number;
+}
+
+interface PresenceRecord {
+  state: string;
+  message: string;
+  timestamp: number;
+}
+
 type FleetTier = "ops" | "infra" | "core" | "quality" | "policy" | "template";
 type FleetCriticality = "critical" | "high" | "medium";
 
@@ -191,10 +201,79 @@ if (url.pathname === "/now") {
       }), { headers: corsHeaders });
     }
 
+    // POST /heartbeat — admin-only, records a heartbeat timestamp
+    if (url.pathname === "/heartbeat" && request.method === "POST") {
+      const auth = request.headers.get("Authorization");
+      if (auth !== `Bearer ${env.ADMIN_KEY}`) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      const now = Date.now();
+
+      const historyRaw = await env.CLANKA_STATE.get("heartbeat_history") || "[]";
+      const history = JSON.parse(historyRaw) as HeartbeatEntry[];
+      history.push({ timestamp: now });
+      const trimmed = history.slice(-500);
+      await env.CLANKA_STATE.put("heartbeat_history", JSON.stringify(trimmed));
+
+      await env.CLANKA_STATE.put("state", JSON.stringify({ message: "heartbeat", timestamp: now }));
+
+      return new Response(JSON.stringify({ success: true }), { headers: corsHeaders });
+    }
+
+    // GET /status/history — last 20 heartbeat entries
+    if (url.pathname === "/status/history" && request.method === "GET") {
+      const historyRaw = await env.CLANKA_STATE.get("heartbeat_history") || "[]";
+      const history = JSON.parse(historyRaw) as HeartbeatEntry[];
+      const last20 = history.slice(-20).reverse();
+      const entries = last20.map((e) => ({
+        timestamp: e.timestamp,
+        iso: new Date(e.timestamp).toISOString(),
+      }));
+      return new Response(JSON.stringify({ entries }), { headers: corsHeaders });
+    }
+
+    // GET /status/uptime — gateway status, last seen, activity, 24h uptime %
+    if (url.pathname === "/status/uptime" && request.method === "GET") {
+      const FIVE_MIN_MS = 5 * 60 * 1000;
+      const BUCKET_MS = FIVE_MIN_MS;
+      const WINDOW_COUNT = 288; // 24h / 5min
+
+      const [historyRaw, presenceRaw] = await Promise.all([
+        env.CLANKA_STATE.get("heartbeat_history"),
+        env.CLANKA_STATE.get("presence"),
+      ]);
+
+      const history = JSON.parse(historyRaw ?? "[]") as HeartbeatEntry[];
+      const presence = presenceRaw ? (JSON.parse(presenceRaw) as PresenceRecord) : null;
+
+      const now = Date.now();
+      const cutoff24h = now - 24 * 60 * 60 * 1000;
+
+      const latest = history.length > 0 ? history[history.length - 1] : null;
+      const gateway_up = latest !== null && now - latest.timestamp < FIVE_MIN_MS;
+      const last_seen = latest ? new Date(latest.timestamp).toISOString() : "";
+
+      const current_activity = presence?.message ?? "";
+
+      const coveredBuckets = new Set<number>();
+      for (const entry of history) {
+        if (entry.timestamp >= cutoff24h) {
+          coveredBuckets.add(Math.floor(entry.timestamp / BUCKET_MS));
+        }
+      }
+      const uptime_pct_24h = Math.round((coveredBuckets.size / WINDOW_COUNT) * 100 * 100) / 100;
+
+      return new Response(
+        JSON.stringify({ gateway_up, last_seen, current_activity, uptime_pct_24h }),
+        { headers: corsHeaders },
+      );
+    }
+
     return new Response(JSON.stringify({
       identity: "CLANKA_API",
       active: true,
-      endpoints: ["/status", "/now", "/admin/tasks", "/fleet/summary"]
+      endpoints: ["/status", "/now", "/admin/tasks", "/fleet/summary", "/status/uptime", "/status/history", "/heartbeat"]
     }), { headers: corsHeaders });
   },
 };

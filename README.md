@@ -37,6 +37,8 @@ Public:
 - `GET /status` - health/status payload
 - `GET /now` - live presence payload used by the site
 - `GET /fleet/summary` - 16-repo fleet map grouped by tier and criticality
+- `GET /status/uptime` - gateway up/down, last seen, current activity, 24h uptime %
+- `GET /status/history` - last 20 heartbeat timestamps (ISO + epoch)
 
 Admin (`Authorization: Bearer <ADMIN_KEY>`):
 - `POST /set-presence` - set presence + optionally append activity/team/tasks
@@ -44,5 +46,28 @@ Admin (`Authorization: Bearer <ADMIN_KEY>`):
 - `POST /admin/tasks` - add task
 - `PUT /admin/tasks` - update task by `id`
 - `DELETE /admin/tasks` - delete task by `id`
+- `POST /heartbeat` - record a heartbeat; updates `heartbeat_history` KV (max 500) and `state` KV
+
+### `GET /status/uptime` response shape
+```json
+{
+  "gateway_up": true,
+  "last_seen": "2026-02-24T12:00:00.000Z",
+  "current_activity": "working on clanka-api",
+  "uptime_pct_24h": 98.61
+}
+```
+- `gateway_up`: `true` if the most recent heartbeat was within the last 5 minutes
+- `uptime_pct_24h`: percentage of 5-minute windows in the last 24 h (288 total) that contain at least one heartbeat
+
+### `GET /status/history` response shape
+```json
+{
+  "entries": [
+    { "timestamp": 1708776000000, "iso": "2026-02-24T12:00:00.000Z" }
+  ]
+}
+```
+Returns the most recent 20 heartbeat entries, newest first.
 
 Fallback root response advertises service identity and endpoint list.
