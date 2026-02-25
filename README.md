@@ -1,48 +1,33 @@
-# clanka-api
+# clanka-api ⚡
 
-`clanka-api` is the edge control API behind Clanka's public presence surface and fleet metadata. It runs as a Cloudflare Worker, persists mutable state in `CLANKA_STATE` KV, and exposes read endpoints for the site plus admin-only write paths for task/presence updates.
-
-## Stack
-- Cloudflare Workers (`wrangler`)
-- TypeScript
-- Cloudflare KV (`CLANKA_STATE`)
-
-## Run And Deploy
-Install dependencies:
-```bash
-npm install
-```
-
-Run locally:
-```bash
-npx wrangler dev
-```
-
-Deploy:
-```bash
-npx wrangler deploy
-```
-
-Required bindings/secrets:
-- KV binding: `CLANKA_STATE`
-- secret: `ADMIN_KEY`
-
-Set secret:
-```bash
-npx wrangler secret put ADMIN_KEY
-```
+Edge control API behind Clanka's public presence surface and fleet metadata. Runs as a Cloudflare Worker, persists mutable state in KV, and exposes read endpoints for the [public site](https://clankamode.github.io) plus admin-only write paths for presence/task updates.
 
 ## Endpoints
-Public:
-- `GET /status` - health/status payload
-- `GET /now` - live presence payload used by the site
-- `GET /fleet/summary` - 16-repo fleet map grouped by tier and criticality
 
-Admin (`Authorization: Bearer <ADMIN_KEY>`):
-- `POST /set-presence` - set presence + optionally append activity/team/tasks
-- `GET /admin/tasks` - list tasks
-- `POST /admin/tasks` - add task
-- `PUT /admin/tasks` - update task by `id`
-- `DELETE /admin/tasks` - delete task by `id`
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/status` | — | Current presence state |
+| `GET` | `/status/uptime` | — | Uptime since last heartbeat |
+| `GET` | `/now` | — | Full sync payload (presence, team, history, tasks) |
+| `GET` | `/pulse` | — | Compact operational pulse |
+| `GET` | `/history` | — | Normalized activity history |
+| `GET` | `/fleet/summary` | — | Fleet registry with tier/criticality metadata |
+| `POST` | `/set-presence` | Bearer | Update presence, team, activity, tasks |
+| `POST` | `/heartbeat` | Bearer | Record heartbeat ping |
+| `POST` | `/admin/activity` | Bearer | Push activity entries |
+| `DELETE` | `/admin/tasks` | Bearer | Remove tasks |
 
-Fallback root response advertises service identity and endpoint list.
+## Stack
+- Cloudflare Workers + KV (`CLANKA_STATE`)
+- TypeScript
+- Wrangler
+
+## Development
+```bash
+npm install
+npx wrangler dev        # local dev server
+npx wrangler deploy     # deploy to edge
+```
+
+## Part of
+[`clankamode`](https://github.com/clankamode) — autonomous tooling fleet
