@@ -1,6 +1,7 @@
 export interface Env {
   CLANKA_STATE: KVNamespace;
   ADMIN_KEY: string;
+  GITHUB_TOKEN?: string;
 }
 
 type FleetTier = "ops" | "infra" | "core" | "quality" | "policy" | "template";
@@ -9,70 +10,79 @@ type FleetRepo = { repo: string; criticality: FleetCriticality; tier: FleetTier 
 type HistoryEntry = { timestamp: number; desc: string; type: string; hash: string };
 
 type ToolStatus = "active" | "development" | "planned";
-type Tool = { name: string; description: string; status: ToolStatus };
+type Tool = { name: string; description: string; status: ToolStatus; tier?: string; criticality?: string };
 type Project = { name: string; description: string; url: string; status: string; last_updated: string };
 
 const HISTORY_LIMIT = 20;
+const REGISTRY_URL = "https://api.github.com/repos/clankamode/assistant-tool-registry/contents/registry.json";
+const REGISTRY_CACHE_KEY = "registry:v1";
+const REGISTRY_TTL_SEC = 3600; // 1 hour
 
-const PROJECTS_REGISTRY: Project[] = [
-  {
-    name: "clanka-api",
-    description: "Edge control API behind Clanka's public presence surface and fleet metadata",
-    url: "https://github.com/clankamode/clanka-api",
-    status: "active",
-    last_updated: "2026-02-25",
-  },
-  {
-    name: "clanka-core",
-    description: "Core orchestration engine for Clanka autonomous tooling fleet",
-    url: "https://github.com/clankamode/clanka-core",
-    status: "active",
-    last_updated: "2026-02-25",
-  },
-  {
-    name: "fleet-status-page",
-    description: "Public status page for fleet health and operational metrics",
-    url: "https://github.com/clankamode/fleet-status-page",
-    status: "active",
-    last_updated: "2026-02-25",
-  },
-  {
-    name: "clanka",
-    description: "Public site and presence surface for Clanka",
-    url: "https://github.com/clankamode/clanka",
-    status: "active",
-    last_updated: "2026-02-25",
-  },
-];
+type RegistryEntry = {
+  repo: string;
+  criticality: FleetCriticality;
+  tier: FleetTier;
+  description?: string;
+};
 
-const TOOLS_REGISTRY: Tool[] = [
-  { name: "ci-triage", description: "Automated CI failure triage and root-cause analysis", status: "active" },
-  { name: "meta-runner", description: "Cross-repo task orchestration and execution", status: "active" },
-  { name: "repo-context", description: "Repository context extraction and summarization", status: "active" },
-  { name: "local-env-doctor", description: "Local environment health checks and remediation", status: "active" },
-  { name: "auto-remediator", description: "Automated issue detection and remediation", status: "active" },
-  { name: "pr-signal-lens", description: "Pull request signal analysis and insights", status: "active" },
-  { name: "assistant-tool-registry", description: "Central registry for assistant-callable tools", status: "active" },
-];
+async function loadRegistryEntries(env: Env): Promise<RegistryEntry[]> {
+  // Try KV cache first
+  const cached = await env.CLANKA_STATE.get(REGISTRY_CACHE_KEY);
+  if (cached) {
+    try {
+      const parsed = JSON.parse(cached) as { tools?: RegistryEntry[] } | RegistryEntry[];
+      return Array.isArray(parsed) ? parsed : (parsed.tools ?? []);
+    } catch { /* fall through to fetch */ }
+  }
 
-const FLEET_REGISTRY: FleetRepo[] = [
-  { repo: "clankamode/pr-signal-lens", criticality: "medium", tier: "ops" },
-  { repo: "clankamode/ci-failure-triager", criticality: "high", tier: "ops" },
-  { repo: "clankamode/ops-control-plane", criticality: "high", tier: "ops" },
-  { repo: "clankamode/meta-runner", criticality: "critical", tier: "ops" },
-  { repo: "clankamode/auto-remediator", criticality: "critical", tier: "ops" },
-  { repo: "clankamode/fleet-admin", criticality: "critical", tier: "infra" },
-  { repo: "clankamode/fleet-status-page", criticality: "high", tier: "infra" },
-  { repo: "clankamode/assistant-tool-registry", criticality: "high", tier: "infra" },
-  { repo: "clankamode/tool-fleet-policy", criticality: "high", tier: "policy" },
-  { repo: "clankamode/tool-starter", criticality: "medium", tier: "template" },
-  { repo: "clankamode/clanka-api", criticality: "high", tier: "core" },
-  { repo: "clankamode/clanka-tools", criticality: "high", tier: "core" },
-  { repo: "clankamode/clanka-core", criticality: "critical", tier: "core" },
-  { repo: "clankamode/clanka", criticality: "critical", tier: "core" },
-  { repo: "clankamode/playwright-contract-guard", criticality: "medium", tier: "quality" },
-  { repo: "clankamode/local-env-doctor", criticality: "high", tier: "quality" },
-];
+  // Fetch from GitHub API (handles private repos via token)
+  try {
+    const headers: Record<string, string> = {
+      "User-Agent": "clanka-api/1.0",
+      "Accept": "application/vnd.github.v3+json",
+    };
+    if (env.GITHUB_TOKEN) headers["Authorization"] = `Bearer ${env.GITHUB_TOKEN}`;
+
+    const res = await fetch(REGISTRY_URL, { headers });
+    if (!res.ok) return [];
+    const meta = await res.json() as { content?: string };
+    if (!meta.content) return [];
+    const json = atob(meta.content.replace(/\n/g, ""));
+    const data = JSON.parse(json) as { tools?: RegistryEntry[] } | RegistryEntry[];
+    const entries = Array.isArray(data) ? data : (data.tools ?? []);
+    // Cache it
+    await env.CLANKA_STATE.put(REGISTRY_CACHE_KEY, JSON.stringify(entries), { expirationTtl: REGISTRY_TTL_SEC });
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
+function registryEntriesToTools(entries: RegistryEntry[]): Tool[] {
+  return entries.map((e) => ({
+    name: e.repo.replace("clankamode/", ""),
+    description: e.description ?? `${e.tier} tool — ${e.criticality} criticality`,
+    status: "active" as ToolStatus,
+    tier: e.tier,
+    criticality: e.criticality,
+  }));
+}
+
+function registryEntriesToProjects(entries: RegistryEntry[]): Project[] {
+  const today = new Date().toISOString().slice(0, 10);
+  return entries
+    .filter((e) => e.tier === "core" || e.criticality === "critical")
+    .map((e) => ({
+      name: e.repo.replace("clankamode/", ""),
+      description: e.description ?? `${e.tier} — ${e.criticality} criticality`,
+      url: `https://github.com/${e.repo}`,
+      status: "active",
+      last_updated: today,
+    }));
+}
+
+// Fleet registry is now derived from the live registry — kept for any legacy references
+const FLEET_REGISTRY: FleetRepo[] = [];
 
 function safeParseJSON<T>(value: string | null, fallback: T): T {
   if (!value) return fallback;
@@ -236,6 +246,13 @@ export default {
         });
       }
 
+      const registryEntries = await loadRegistryEntries(env);
+      const fleetItems: FleetRepo[] = registryEntries.map((e) => ({
+        repo: e.repo,
+        criticality: e.criticality,
+        tier: e.tier,
+      }));
+
       const tiers: Record<FleetTier, string[]> = {
         ops: [],
         infra: [],
@@ -250,7 +267,7 @@ export default {
         medium: [],
       };
 
-      for (const item of FLEET_REGISTRY) {
+      for (const item of fleetItems) {
         tiers[item.tier].push(item.repo);
         byCriticality[item.criticality].push(item.repo);
       }
@@ -258,10 +275,11 @@ export default {
       return new Response(
         JSON.stringify({
           generatedAt: new Date().toISOString(),
-          totalRepos: FLEET_REGISTRY.length,
-          repos: FLEET_REGISTRY,
+          totalRepos: fleetItems.length,
+          repos: fleetItems,
           tiers,
           byCriticality,
+          source: "registry",
         }),
         { headers: corsHeaders },
       );
@@ -380,8 +398,13 @@ export default {
         });
       }
 
+      const entries = await loadRegistryEntries(env);
+      const projects = entries.length > 0
+        ? registryEntriesToProjects(entries)
+        : [];
+
       return new Response(
-        JSON.stringify({ projects: PROJECTS_REGISTRY }),
+        JSON.stringify({ projects, source: "registry", cached: true }),
         { headers: corsHeaders },
       );
     }
@@ -394,10 +417,16 @@ export default {
         });
       }
 
+      const entries = await loadRegistryEntries(env);
+      const tools = entries.length > 0
+        ? registryEntriesToTools(entries)
+        : [];
+
       return new Response(
         JSON.stringify({
-          tools: TOOLS_REGISTRY,
-          total: TOOLS_REGISTRY.length,
+          tools,
+          total: tools.length,
+          source: "registry",
         }),
         { headers: corsHeaders },
       );
