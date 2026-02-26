@@ -2,7 +2,7 @@
 > Last updated: 2026-02-25 | Status: open
 
 ## 🔴 High Priority
-- [ ] **Deploy to Cloudflare** — verify worker is live at production URL. Run `npx wrangler deploy`, set KV namespace `CLANKA_STATE` if not done
+- [x] **Deploy to Cloudflare** — live at https://clanka-api.clankamode.workers.dev (deployed 2026-02-26)
 - [ ] **Write tests for `/projects` and `/tools` endpoints** — added in ce0c893 but may lack test coverage. Add: response shape, empty-state, 404 on unknown paths
 - [ ] **Wire `/projects` data to real source** — likely hardcoded. Fetch from `assistant-tool-registry` registry.json via GitHub raw URL or KV cache
 
