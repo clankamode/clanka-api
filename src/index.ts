@@ -8,7 +8,52 @@ type FleetCriticality = "critical" | "high" | "medium";
 type FleetRepo = { repo: string; criticality: FleetCriticality; tier: FleetTier };
 type HistoryEntry = { timestamp: number; desc: string; type: string; hash: string };
 
+type ToolStatus = "active" | "development" | "planned";
+type Tool = { name: string; description: string; status: ToolStatus };
+type Project = { name: string; description: string; url: string; status: string; last_updated: string };
+
 const HISTORY_LIMIT = 20;
+
+const PROJECTS_REGISTRY: Project[] = [
+  {
+    name: "clanka-api",
+    description: "Edge control API behind Clanka's public presence surface and fleet metadata",
+    url: "https://github.com/clankamode/clanka-api",
+    status: "active",
+    last_updated: "2026-02-25",
+  },
+  {
+    name: "clanka-core",
+    description: "Core orchestration engine for Clanka autonomous tooling fleet",
+    url: "https://github.com/clankamode/clanka-core",
+    status: "active",
+    last_updated: "2026-02-25",
+  },
+  {
+    name: "fleet-status-page",
+    description: "Public status page for fleet health and operational metrics",
+    url: "https://github.com/clankamode/fleet-status-page",
+    status: "active",
+    last_updated: "2026-02-25",
+  },
+  {
+    name: "clanka",
+    description: "Public site and presence surface for Clanka",
+    url: "https://github.com/clankamode/clanka",
+    status: "active",
+    last_updated: "2026-02-25",
+  },
+];
+
+const TOOLS_REGISTRY: Tool[] = [
+  { name: "ci-triage", description: "Automated CI failure triage and root-cause analysis", status: "active" },
+  { name: "meta-runner", description: "Cross-repo task orchestration and execution", status: "active" },
+  { name: "repo-context", description: "Repository context extraction and summarization", status: "active" },
+  { name: "local-env-doctor", description: "Local environment health checks and remediation", status: "active" },
+  { name: "auto-remediator", description: "Automated issue detection and remediation", status: "active" },
+  { name: "pr-signal-lens", description: "Pull request signal analysis and insights", status: "active" },
+  { name: "assistant-tool-registry", description: "Central registry for assistant-callable tools", status: "active" },
+];
 
 const FLEET_REGISTRY: FleetRepo[] = [
   { repo: "clankamode/pr-signal-lens", criticality: "medium", tier: "ops" },
@@ -327,8 +372,38 @@ export default {
       return new Response(JSON.stringify({ success: true, entry }), { headers: corsHeaders });
     }
 
-    
-if (url.pathname === "/now") {
+    if (url.pathname === "/projects") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      return new Response(
+        JSON.stringify({ projects: PROJECTS_REGISTRY }),
+        { headers: corsHeaders },
+      );
+    }
+
+    if (url.pathname === "/tools") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          tools: TOOLS_REGISTRY,
+          total: TOOLS_REGISTRY.length,
+        }),
+        { headers: corsHeaders },
+      );
+    }
+
+    if (url.pathname === "/now") {
       const [presenceRaw, historyRaw, teamRaw, startedRaw] = await Promise.all([
         env.CLANKA_STATE.get("presence"),
         env.CLANKA_STATE.get("history"),
@@ -363,7 +438,7 @@ if (url.pathname === "/now") {
     return new Response(JSON.stringify({
       identity: "CLANKA_API",
       active: true,
-      endpoints: ["/status", "/now", "/history", "/pulse", "/admin/tasks", "/admin/activity", "/fleet/summary"]
+      endpoints: ["/status", "/now", "/history", "/pulse", "/projects", "/tools", "/admin/tasks", "/admin/activity", "/fleet/summary"]
     }), { headers: corsHeaders });
   },
 };
