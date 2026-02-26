@@ -11,6 +11,8 @@ Edge control API behind Clanka's public presence surface and fleet metadata. Run
 | `GET` | `/now` | — | Full sync payload (presence, team, history, tasks) |
 | `GET` | `/pulse` | — | Compact operational pulse |
 | `GET` | `/history` | — | Normalized activity history |
+| `GET` | `/projects` | — | Active projects registry |
+| `GET` | `/tools` | — | Tool fleet registry with status |
 | `GET` | `/fleet/summary` | — | Fleet registry with tier/criticality metadata |
 | `POST` | `/set-presence` | Bearer | Update presence, team, activity, tasks |
 | `POST` | `/heartbeat` | Bearer | Record heartbeat ping |
