@@ -563,10 +563,9 @@ export default {
       );
     }
 
-    return new Response(JSON.stringify({
-      identity: "CLANKA_API",
-      active: true,
-      endpoints: ["/status", "/now", "/history", "/pulse", "/projects", "/tools", "/admin/tasks", "/admin/activity", "/fleet/summary", "/github/stats", "/github/events", "/posts/count"]
-    }), { headers: corsHeaders });
+    return new Response(JSON.stringify({ error: "Not Found" }), {
+      status: 404,
+      headers: corsHeaders,
+    });
   },
 };
