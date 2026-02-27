@@ -1,3 +1,5 @@
+import { loadGithubEvents } from "./github-events";
+
 export interface Env {
   CLANKA_STATE: KVNamespace;
   ADMIN_KEY: string;
@@ -539,6 +541,14 @@ export default {
       return new Response(JSON.stringify(stats), { headers: corsHeaders });
     }
 
+    if (url.pathname === "/github/events") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), { status: 405, headers: corsHeaders });
+      }
+      const events = await loadGithubEvents(env.CLANKA_STATE);
+      return new Response(JSON.stringify({ events }), { headers: corsHeaders });
+    }
+
     if (url.pathname === "/posts/count") {
       if (request.method !== "GET") {
         return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
@@ -556,7 +566,7 @@ export default {
     return new Response(JSON.stringify({
       identity: "CLANKA_API",
       active: true,
-      endpoints: ["/status", "/now", "/history", "/pulse", "/projects", "/tools", "/admin/tasks", "/admin/activity", "/fleet/summary", "/github/stats", "/posts/count"]
+      endpoints: ["/status", "/now", "/history", "/pulse", "/projects", "/tools", "/admin/tasks", "/admin/activity", "/fleet/summary", "/github/stats", "/github/events", "/posts/count"]
     }), { headers: corsHeaders });
   },
 };
