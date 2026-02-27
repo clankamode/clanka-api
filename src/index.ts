@@ -18,6 +18,9 @@ const REGISTRY_URL = "https://api.github.com/repos/clankamode/assistant-tool-reg
 const REGISTRY_CACHE_KEY = "registry:v1";
 const REGISTRY_TTL_SEC = 3600; // 1 hour
 
+const GITHUB_STATS_CACHE_KEY = "github:stats:v1";
+const GITHUB_STATS_TTL_SEC = 3600; // 1 hour
+
 type RegistryEntry = {
   repo: string;
   criticality: FleetCriticality;
@@ -79,6 +82,66 @@ function registryEntriesToProjects(entries: RegistryEntry[]): Project[] {
       status: "active",
       last_updated: today,
     }));
+}
+
+type GithubStatsPayload = {
+  repoCount: number;
+  totalStars: number;
+  lastPushedAt: string | null;
+  lastPushedRepo: string | null;
+  cachedAt: string;
+};
+
+async function loadGithubStats(env: Env): Promise<GithubStatsPayload> {
+  const cached = await env.CLANKA_STATE.get(GITHUB_STATS_CACHE_KEY);
+  if (cached) {
+    try {
+      return JSON.parse(cached) as GithubStatsPayload;
+    } catch { /* fall through */ }
+  }
+
+  const ghHeaders = {
+    "User-Agent": "clanka-api/1.0",
+    "Accept": "application/vnd.github.v3+json",
+  };
+
+  const [userRes, reposRes] = await Promise.all([
+    fetch("https://api.github.com/users/clankamode", { headers: ghHeaders }),
+    fetch("https://api.github.com/users/clankamode/repos?per_page=100&type=owner", { headers: ghHeaders }),
+  ]);
+
+  type GhRepo = { stargazers_count: number; pushed_at: string; name: string };
+  const repos: GhRepo[] = reposRes.ok ? (await reposRes.json() as GhRepo[]) : [];
+
+  let repoCount = 0;
+  if (userRes.ok) {
+    const user = await userRes.json() as { public_repos?: number };
+    repoCount = user.public_repos ?? repos.length;
+  } else {
+    repoCount = repos.length;
+  }
+
+  const totalStars = repos.reduce((sum, r) => sum + (r.stargazers_count ?? 0), 0);
+
+  let lastPushedAt: string | null = null;
+  let lastPushedRepo: string | null = null;
+  for (const r of repos) {
+    if (!lastPushedAt || r.pushed_at > lastPushedAt) {
+      lastPushedAt = r.pushed_at;
+      lastPushedRepo = r.name;
+    }
+  }
+
+  const payload: GithubStatsPayload = {
+    repoCount,
+    totalStars,
+    lastPushedAt,
+    lastPushedRepo,
+    cachedAt: new Date().toISOString(),
+  };
+
+  await env.CLANKA_STATE.put(GITHUB_STATS_CACHE_KEY, JSON.stringify(payload), { expirationTtl: GITHUB_STATS_TTL_SEC });
+  return payload;
 }
 
 // Fleet registry is now derived from the live registry — kept for any legacy references
@@ -464,10 +527,36 @@ export default {
       }), { headers: corsHeaders });
     }
 
+    if (url.pathname === "/github/stats") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const stats = await loadGithubStats(env);
+      return new Response(JSON.stringify(stats), { headers: corsHeaders });
+    }
+
+    if (url.pathname === "/posts/count") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      return new Response(
+        JSON.stringify({ count: 11, lastPost: "011", lastPostDate: "2026-02-26", lastPostSlug: "claude-cli-unlock" }),
+        { headers: corsHeaders },
+      );
+    }
+
     return new Response(JSON.stringify({
       identity: "CLANKA_API",
       active: true,
-      endpoints: ["/status", "/now", "/history", "/pulse", "/projects", "/tools", "/admin/tasks", "/admin/activity", "/fleet/summary"]
+      endpoints: ["/status", "/now", "/history", "/pulse", "/projects", "/tools", "/admin/tasks", "/admin/activity", "/fleet/summary", "/github/stats", "/posts/count"]
     }), { headers: corsHeaders });
   },
 };
