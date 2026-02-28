@@ -30,6 +30,20 @@ type RegistryEntry = {
   description?: string;
 };
 
+type TaskPriority = "red" | "yellow" | "green";
+type RepoTask = { priority: TaskPriority; text: string; done: boolean };
+type RepoTasksPayload = { repo: string; tasks: RepoTask[] };
+
+function decodeBase64(value: string): string {
+  const normalized = value.replace(/\n/g, "");
+  if (typeof atob === "function") {
+    const binary = atob(normalized);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  }
+  return Buffer.from(normalized, "base64").toString("utf8");
+}
+
 async function loadRegistryEntries(env: Env): Promise<RegistryEntry[]> {
   // Try KV cache first
   const cached = await env.CLANKA_STATE.get(REGISTRY_CACHE_KEY);
@@ -52,12 +66,65 @@ async function loadRegistryEntries(env: Env): Promise<RegistryEntry[]> {
     if (!res.ok) return [];
     const meta = await res.json() as { content?: string };
     if (!meta.content) return [];
-    const json = atob(meta.content.replace(/\n/g, ""));
+    const json = decodeBase64(meta.content);
     const data = JSON.parse(json) as { tools?: RegistryEntry[] } | RegistryEntry[];
     const entries = Array.isArray(data) ? data : (data.tools ?? []);
     // Cache it
     await env.CLANKA_STATE.put(REGISTRY_CACHE_KEY, JSON.stringify(entries), { expirationTtl: REGISTRY_TTL_SEC });
     return entries;
+  } catch {
+    return [];
+  }
+}
+
+function parseOpenTasksMarkdown(markdown: string): RepoTask[] {
+  const lines = markdown.split(/\r?\n/);
+  const tasks: RepoTask[] = [];
+  let currentPriority: TaskPriority | null = null;
+
+  for (const line of lines) {
+    if (line.includes("🔴")) {
+      currentPriority = "red";
+      continue;
+    }
+    if (line.includes("🟡")) {
+      currentPriority = "yellow";
+      continue;
+    }
+    if (line.includes("🟢")) {
+      currentPriority = "green";
+      continue;
+    }
+
+    const match = line.match(/^\s*-\s\[\s\]\s\*\*(.+?)\*\*\s*$/);
+    if (match && currentPriority) {
+      tasks.push({
+        priority: currentPriority,
+        text: match[1].trim(),
+        done: false,
+      });
+    }
+  }
+
+  return tasks;
+}
+
+async function loadRepoTasks(env: Env, repo: string): Promise<RepoTask[]> {
+  const repoName = repo.startsWith("clankamode/") ? repo.slice("clankamode/".length) : repo;
+  const url = `https://api.github.com/repos/clankamode/${repoName}/contents/TASKS.md`;
+  const headers: Record<string, string> = {
+    "User-Agent": "clanka-api/1.0",
+    "Accept": "application/vnd.github.v3+json",
+  };
+  if (env.GITHUB_TOKEN) headers["Authorization"] = `Bearer ${env.GITHUB_TOKEN}`;
+
+  try {
+    const res = await fetch(url, { headers });
+    if (!res.ok) return [];
+    const body = await res.json() as { content?: string };
+    if (!body.content) return [];
+    const markdown = decodeBase64(body.content);
+    return parseOpenTasksMarkdown(markdown);
   } catch {
     return [];
   }
@@ -495,6 +562,26 @@ export default {
         }),
         { headers: corsHeaders },
       );
+    }
+
+    if (url.pathname === "/tasks") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const entries = await loadRegistryEntries(env);
+      const repos = entries.map((entry) => entry.repo);
+      const payload: RepoTasksPayload[] = await Promise.all(
+        repos.map(async (repo) => ({
+          repo,
+          tasks: await loadRepoTasks(env, repo),
+        })),
+      );
+
+      return new Response(JSON.stringify(payload), { headers: corsHeaders });
     }
 
     if (url.pathname === "/now") {

@@ -7,7 +7,7 @@
 - [x] **Wire `/projects` data to real source** — fetches from `assistant-tool-registry` via GitHub API, 1hr KV cache (2026-02-26)
 
 ## 🟡 Medium Priority
-- [ ] **Add `/tasks` endpoint** — reads `TASKS.md` from each registered repo, parses open checkboxes, returns `{ repo, tasks: [{ priority, text, done }] }[]`
+- [x] **Add `/tasks` endpoint** — reads `TASKS.md` from each registered repo, parses open checkboxes, returns `{ repo, tasks: [{ priority, text, done }] }[]` (completed 2026-02-28)
 - [ ] **Add auth middleware tests** — test: missing auth → 401, wrong token → 401, correct token → 200
 - [ ] **Add request logging** — log each request to KV list with TTL; max 100 entries rolling
 - [ ] **KV TTL on presence** — if no heartbeat in 10 min, `/status` returns `{ status: "offline" }`
