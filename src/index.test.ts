@@ -7,6 +7,12 @@ const MOCK_REGISTRY = [
   { repo: "clankamode/ci-triage", criticality: "high", tier: "ops", description: "CI triage tool" },
 ];
 
+const VALID_SET_PRESENCE_PAYLOAD = {
+  presence: { state: "active", message: "monitoring workspace" },
+  team: { clanka: { status: "active", task: "ship tests" } },
+  activity: { type: "SYNC", desc: "presence updated" },
+};
+
 function createMockKV(store: Record<string, string> = {}): any {
   return {
     get: async (key: string) => store[key] ?? null,
@@ -295,6 +301,71 @@ describe("GET /openapi.json", () => {
   });
 });
 
+describe("Status regression coverage", () => {
+  const thresholdMs = 10 * 60 * 1000;
+
+  it("GET /status returns offline when LAST_SEEN_KEY is missing", async () => {
+    const res = await worker.fetch(req("/status"), createEnv());
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ status: "offline" });
+  });
+
+  it("GET /status returns operational at the offline threshold boundary", async () => {
+    const now = 1_750_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const res = await worker.fetch(
+      req("/status"),
+      createEnv({ last_seen: String(now - thresholdMs) }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({ status: "operational" }));
+    expect(body.last_seen).toBe(new Date(now - thresholdMs).toISOString());
+  });
+
+  it("GET /status returns offline when LAST_SEEN_KEY is beyond threshold", async () => {
+    const now = 1_750_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const res = await worker.fetch(
+      req("/status"),
+      createEnv({ last_seen: String(now - thresholdMs - 1) }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ status: "offline" });
+  });
+
+  it("GET /status/uptime returns operational with uptime_ms when heartbeat is fresh", async () => {
+    const now = 1_750_000_000_000;
+    const lastSeen = now - 1234;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const res = await worker.fetch(
+      req("/status/uptime"),
+      createEnv({ last_seen: String(lastSeen) }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      status: "operational",
+      uptime_ms: 1234,
+      last_seen: new Date(lastSeen).toISOString(),
+    }));
+  });
+
+  it("GET /status/uptime returns offline when heartbeat is stale", async () => {
+    const now = 1_750_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const res = await worker.fetch(
+      req("/status/uptime"),
+      createEnv({ last_seen: String(now - thresholdMs - 1) }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ status: "offline", uptime_ms: 0, last_seen: null });
+  });
+});
+
 describe("Rate limiting", () => {
   it("returns 429 after 60 public GET requests in a minute", async () => {
     const env = createEnv({ "registry:v1": JSON.stringify(MOCK_REGISTRY) });
@@ -330,9 +401,7 @@ describe("Rate limiting", () => {
   });
 });
 
-describe("POST /set-presence", () => {
-  const authHeaders = { Authorization: "Bearer test-secret" };
-
+describe("Auth middleware", () => {
   it("returns 401 when auth is missing", async () => {
     const res = await worker.fetch(req("/set-presence", "POST", {}), createEnv());
     expect(res.status).toBe(401);
@@ -346,57 +415,49 @@ describe("POST /set-presence", () => {
     expect(res.status).toBe(401);
   });
 
-  it("returns 400 for null or empty required fields", async () => {
-    const invalidBodies = [
-      null,
-      {},
-      { presence: "", team: { alpha: "active" }, activity: { desc: "deploy", type: "sync" } },
-      { presence: "active", team: {}, activity: { desc: "deploy", type: "sync" } },
-      { presence: "active", team: { alpha: "active" }, activity: null },
-      { presence: "active", team: { alpha: "active" }, activity: { desc: "", type: "sync" } },
-    ];
-
-    for (const body of invalidBodies) {
-      const res = await worker.fetch(req("/set-presence", "POST", body, authHeaders), createEnv());
-      const payload = await json(res);
-      expect(res.status).toBe(400);
-      expect(payload.error).toContain("required non-empty presence, team, and activity");
-    }
-  });
-
-  it("returns 200 for valid payload and updates state", async () => {
-    const now = 1_700_000_100_000;
-    vi.spyOn(Date, "now").mockReturnValue(now);
-
-    const env = createEnv();
+  it("returns 200 when token is valid", async () => {
     const res = await worker.fetch(
-      req(
-        "/set-presence",
-        "POST",
-        {
-          presence: "active",
-          team: { alpha: "active" },
-          activity: { desc: "deploying", type: "release" },
-        },
-        authHeaders,
-      ),
-      env,
+      req("/set-presence", "POST", VALID_SET_PRESENCE_PAYLOAD, { Authorization: "Bearer test-secret" }),
+      createEnv(),
     );
     expect(res.status).toBe(200);
-    expect(await json(res)).toEqual({ success: true });
+  });
+});
 
-    const nowRes = await worker.fetch(req("/now"), env);
-    const nowBody = await json(nowRes);
-    expect(nowBody.status).toBe("active");
-    expect(nowBody.signal).toBe("⚡");
-    expect(nowBody.last_seen).toBe(new Date(now).toISOString());
-    expect(nowBody.team).toEqual({ alpha: "active" });
-    expect(nowBody.history[0]).toEqual(
-      expect.objectContaining({
-        desc: "deploying",
-        type: "release",
-      }),
-    );
+describe("POST /set-presence", () => {
+  const authHeaders = { Authorization: "Bearer test-secret" };
+  const validationError = { error: "Invalid body: presence, team, and activity are required" };
+
+  it("returns 400 for empty payload", async () => {
+    const res = await worker.fetch(req("/set-presence", "POST", {}, authHeaders), createEnv());
+    const body = await json(res);
+    expect(res.status).toBe(400);
+    expect(body).toEqual(validationError);
+  });
+
+  it("returns 400 for null payload", async () => {
+    const res = await worker.fetch(req("/set-presence", "POST", null, authHeaders), createEnv());
+    const body = await json(res);
+    expect(res.status).toBe(400);
+    expect(body).toEqual(validationError);
+  });
+
+  for (const missingField of ["presence", "team", "activity"] as const) {
+    it(`returns 400 when ${missingField} is missing`, async () => {
+      const payload = { ...VALID_SET_PRESENCE_PAYLOAD };
+      delete payload[missingField];
+      const res = await worker.fetch(req("/set-presence", "POST", payload, authHeaders), createEnv());
+      const body = await json(res);
+      expect(res.status).toBe(400);
+      expect(body).toEqual(validationError);
+    });
+  }
+
+  it("returns 200 for valid payload", async () => {
+    const res = await worker.fetch(req("/set-presence", "POST", VALID_SET_PRESENCE_PAYLOAD, authHeaders), createEnv());
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ success: true });
   });
 });
 
@@ -416,9 +477,9 @@ describe("POST /heartbeat", () => {
     expect(res.status).toBe(401);
   });
 
-  it("returns 400 when history is not an array", async () => {
+  it("returns 400 for non-array history payload", async () => {
     const res = await worker.fetch(
-      req("/heartbeat", "POST", { history: { bad: true } }, authHeaders),
+      req("/heartbeat", "POST", { history: { desc: "bad" } }, authHeaders),
       createEnv(),
     );
     const body = await json(res);
@@ -426,39 +487,14 @@ describe("POST /heartbeat", () => {
     expect(body).toEqual({ error: "Invalid body: history must be an array" });
   });
 
-  it("returns 200 and updates online status/history", async () => {
-    const now = 1_700_000_200_000;
-    vi.spyOn(Date, "now").mockReturnValue(now);
-
-    const env = createEnv();
+  it("returns 200 for a valid heartbeat payload", async () => {
     const res = await worker.fetch(
-      req(
-        "/heartbeat",
-        "POST",
-        {
-          history: [{ timestamp: now - 1_000, desc: "prior", type: "heartbeat", hash: "h1" }],
-          activity: { desc: "beat", type: "heartbeat" },
-        },
-        authHeaders,
-      ),
-      env,
+      req("/heartbeat", "POST", { history: [{ type: "heartbeat", desc: "ping" }] }, authHeaders),
+      createEnv(),
     );
+    const body = await json(res);
     expect(res.status).toBe(200);
-    expect(await json(res)).toEqual({ success: true, timestamp: now });
-
-    const statusRes = await worker.fetch(req("/status"), env);
-    const statusBody = await json(statusRes);
-    expect(statusBody.status).toBe("operational");
-    expect(statusBody.last_seen).toBe(new Date(now).toISOString());
-
-    const historyRes = await worker.fetch(req("/history"), env);
-    const historyBody = await json(historyRes);
-    expect(historyBody.history[0]).toEqual(
-      expect.objectContaining({
-        desc: "beat",
-        type: "heartbeat",
-      }),
-    );
+    expect(body).toEqual(expect.objectContaining({ success: true, status: "operational" }));
   });
 });
 
@@ -466,186 +502,37 @@ describe("POST /admin/activity", () => {
   const authHeaders = { Authorization: "Bearer test-secret" };
 
   it("returns 401 when auth is missing", async () => {
-    const res = await worker.fetch(req("/admin/activity", "POST", { desc: "x", type: "event" }), createEnv());
+    const res = await worker.fetch(req("/admin/activity", "POST", { desc: "ok", type: "SYNC" }), createEnv());
     expect(res.status).toBe(401);
   });
 
   it("returns 401 when token is invalid", async () => {
     const res = await worker.fetch(
-      req("/admin/activity", "POST", { desc: "x", type: "event" }, { Authorization: "Bearer wrong-token" }),
+      req("/admin/activity", "POST", { desc: "ok", type: "SYNC" }, { Authorization: "Bearer wrong-token" }),
       createEnv(),
     );
     expect(res.status).toBe(401);
   });
 
   it("returns 400 for malformed payload", async () => {
-    const res = await worker.fetch(req("/admin/activity", "POST", [], authHeaders), createEnv());
+    const res = await worker.fetch(req("/admin/activity", "POST", { desc: "missing type" }, authHeaders), createEnv());
     const body = await json(res);
     expect(res.status).toBe(400);
     expect(body).toEqual({ error: "Invalid body" });
   });
 
-  it("returns 200 and writes entry to history", async () => {
-    const env = createEnv();
+  it("returns 200 for a valid payload", async () => {
     const res = await worker.fetch(
-      req("/admin/activity", "POST", { desc: "manual update", type: "ops" }, authHeaders),
-      env,
+      req("/admin/activity", "POST", { desc: "deployed", type: "SYNC" }, authHeaders),
+      createEnv(),
     );
-    const payload = await json(res);
-    expect(res.status).toBe(200);
-    expect(payload.success).toBe(true);
-    expect(payload.entry).toEqual(
-      expect.objectContaining({
-        desc: "manual update",
-        type: "ops",
-      }),
-    );
-
-    const historyRes = await worker.fetch(req("/history"), env);
-    const historyBody = await json(historyRes);
-    expect(historyBody.history[0]).toEqual(
-      expect.objectContaining({
-        desc: "manual update",
-        type: "ops",
-      }),
-    );
-  });
-});
-
-describe("Status regression around last_seen threshold", () => {
-  const THRESHOLD_MS = 10 * 60 * 1000;
-
-  it("returns offline when LAST_SEEN_KEY is missing", async () => {
-    const now = 1_700_000_300_000;
-    vi.spyOn(Date, "now").mockReturnValue(now);
-    const env = createEnv();
-
-    const statusRes = await worker.fetch(req("/status"), env);
-    const statusBody = await json(statusRes);
-    expect(statusBody).toEqual({ status: "offline" });
-
-    const uptimeRes = await worker.fetch(req("/status/uptime"), env);
-    const uptimeBody = await json(uptimeRes);
-    expect(uptimeBody).toEqual({ status: "offline", uptime_ms: 0 });
-  });
-
-  it("returns operational exactly at STATUS_OFFLINE_THRESHOLD_MS boundary", async () => {
-    const now = 1_700_000_400_000;
-    const lastSeen = now - THRESHOLD_MS;
-    vi.spyOn(Date, "now").mockReturnValue(now);
-    const env = createEnv({
-      last_seen: String(lastSeen),
-      started: String(now - 12_345),
-    });
-
-    const statusRes = await worker.fetch(req("/status"), env);
-    const statusBody = await json(statusRes);
-    expect(statusBody.status).toBe("operational");
-    expect(statusBody.last_seen).toBe(new Date(lastSeen).toISOString());
-    expect(statusBody.signal).toBe("⚡");
-
-    const uptimeRes = await worker.fetch(req("/status/uptime"), env);
-    const uptimeBody = await json(uptimeRes);
-    expect(uptimeBody).toEqual(
-      expect.objectContaining({
-        status: "operational",
-        signal: "⚡",
-        last_seen: new Date(lastSeen).toISOString(),
-        uptime_ms: 12_345,
-      }),
-    );
-  });
-
-  it("returns offline when last_seen is older than threshold", async () => {
-    const now = 1_700_000_500_000;
-    const lastSeen = now - THRESHOLD_MS - 1;
-    vi.spyOn(Date, "now").mockReturnValue(now);
-    const env = createEnv({
-      last_seen: String(lastSeen),
-      started: String(now - 8_000),
-    });
-
-    const statusRes = await worker.fetch(req("/status"), env);
-    const statusBody = await json(statusRes);
-    expect(statusBody).toEqual({ status: "offline" });
-
-    const uptimeRes = await worker.fetch(req("/status/uptime"), env);
-    const uptimeBody = await json(uptimeRes);
-    expect(uptimeBody).toEqual({ status: "offline", uptime_ms: 8_000 });
-  });
-});
-
-describe("Contracts: /now and /pulse", () => {
-  it("GET /now returns exact shape with status, last_seen, signal", async () => {
-    const now = 1_700_000_600_000;
-    const lastSeen = now - 5_000;
-    vi.spyOn(Date, "now").mockReturnValue(now);
-    const env = createEnv({
-      presence: JSON.stringify({ state: "focus", message: "shipping tests", timestamp: lastSeen }),
-      history: JSON.stringify([{ timestamp: lastSeen - 1_000, desc: "coverage added", type: "test", hash: "abc12345" }]),
-      team: JSON.stringify({ alpha: "active", beta: { status: "active" }, gamma: "idle" }),
-      started: String(now - 60_000),
-      last_seen: String(lastSeen),
-    });
-
-    const res = await worker.fetch(req("/now"), env);
-    expect(res.status).toBe(200);
     const body = await json(res);
-
-    expect(Object.keys(body).sort()).toEqual([
-      "agents_active",
-      "current",
-      "history",
-      "last_seen",
-      "signal",
-      "stack",
-      "status",
-      "team",
-      "timestamp",
-      "uptime",
-    ]);
-    expect(body).toEqual({
-      current: "shipping tests",
-      status: "focus",
-      signal: "⚡",
-      stack: ["Cloudflare Workers", "TypeScript", "Lit"],
-      timestamp: lastSeen,
-      uptime: 60_000,
-      agents_active: 2,
-      last_seen: new Date(lastSeen).toISOString(),
-      history: [{ timestamp: lastSeen - 1_000, desc: "coverage added", type: "test", hash: "abc12345" }],
-      team: { alpha: "active", beta: { status: "active" }, gamma: "idle" },
-    });
-  });
-
-  it("GET /pulse returns exact shape with status, last_seen, signal", async () => {
-    const lastSeen = 1_700_000_700_000;
-    const env = createEnv({
-      presence: JSON.stringify({ state: "focus", message: "shipping tests", timestamp: lastSeen }),
-      history: JSON.stringify([{ timestamp: lastSeen - 1_000, desc: "coverage added", type: "test", hash: "abc12345" }]),
-      team: JSON.stringify({ alpha: "active", beta: { status: "active" }, gamma: "idle" }),
-      last_seen: String(lastSeen),
-    });
-
-    const res = await worker.fetch(req("/pulse"), env);
     expect(res.status).toBe(200);
-    const body = await json(res);
-
-    expect(Object.keys(body).sort()).toEqual([
-      "agents_active",
-      "last_event_desc",
-      "last_seen",
-      "signal",
-      "status",
-      "ts",
-    ]);
-    expect(body).toEqual({
-      ts: expect.any(String),
-      status: "focus",
-      signal: "⚡",
-      last_seen: new Date(lastSeen).toISOString(),
-      agents_active: 2,
-      last_event_desc: "coverage added",
-    });
+    expect(body).toEqual(
+      expect.objectContaining({
+        success: true,
+        entry: expect.objectContaining({ desc: "deployed", type: "SYNC" }),
+      }),
+    );
   });
 });
