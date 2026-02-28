@@ -14,8 +14,8 @@
 
 ## 🟢 Low Priority / Nice to Have
 - [x] **`/changelog` endpoint** — last 10 git commits from key repos via GitHub API
-- [ ] **Rate limiting** — IP-based rate limit on public GET endpoints
-- [ ] **OpenAPI spec** — served at `/openapi.json`
+- [x] **Rate limiting** — IP-based rate limit on public GET endpoints (2026-02-28)
+- [x] **OpenAPI spec** — served at `/openapi.json` (2026-02-28)
 
 ## 🧠 Notes
 - Stack: Cloudflare Workers + KV (`CLANKA_STATE`), TypeScript, Wrangler

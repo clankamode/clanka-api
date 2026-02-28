@@ -42,6 +42,251 @@ const CHANGELOG_CACHE_KEY = "changelog:v1";
 const CHANGELOG_TTL_SEC = 5 * 60; // 5 minutes
 const CHANGELOG_URL = "https://api.github.com/repos/clankamode/clanka/commits?per_page=10";
 
+const RATE_LIMIT_KEY_PREFIX = "rate_limit:ip:";
+const RATE_LIMIT_WINDOW_SEC = 60;
+const RATE_LIMIT_WINDOW_MS = RATE_LIMIT_WINDOW_SEC * 1000;
+const RATE_LIMIT_MAX_REQUESTS = 60;
+
+const OPENAPI_SPEC = {
+  openapi: "3.0.3",
+  info: {
+    title: "clanka-api",
+    version: "1.0.0",
+    description: "Edge API for Clanka public endpoints",
+  },
+  paths: {
+    "/status": {
+      get: {
+        summary: "Get service status",
+        responses: {
+          "200": {
+            description: "Current status payload",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    status: { type: "string" },
+                    timestamp: { type: "string" },
+                    signal: { type: "string" },
+                    last_seen: { type: "string" },
+                  },
+                  additionalProperties: true,
+                },
+              },
+            },
+          },
+          "429": {
+            description: "Too Many Requests",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    error: { type: "string" },
+                  },
+                  required: ["error"],
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    "/health": {
+      get: {
+        summary: "Health check",
+        responses: {
+          "200": {
+            description: "Health payload",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    status: { type: "string" },
+                    timestamp: { type: "string" },
+                    signal: { type: "string" },
+                    last_seen: { type: "string" },
+                  },
+                  additionalProperties: true,
+                },
+              },
+            },
+          },
+          "429": {
+            description: "Too Many Requests",
+          },
+        },
+      },
+    },
+    "/projects": {
+      get: {
+        summary: "Get active projects from registry",
+        responses: {
+          "200": {
+            description: "Projects payload",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    projects: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          name: { type: "string" },
+                          description: { type: "string" },
+                          url: { type: "string" },
+                          status: { type: "string" },
+                          last_updated: { type: "string" },
+                        },
+                        required: ["name", "description", "url", "status", "last_updated"],
+                      },
+                    },
+                    source: { type: "string" },
+                    cached: { type: "boolean" },
+                  },
+                  required: ["projects", "source", "cached"],
+                },
+              },
+            },
+          },
+          "429": {
+            description: "Too Many Requests",
+          },
+        },
+      },
+    },
+    "/tools": {
+      get: {
+        summary: "Get registered tools",
+        responses: {
+          "200": {
+            description: "Tools payload",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    tools: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          name: { type: "string" },
+                          description: { type: "string" },
+                          status: { type: "string" },
+                          tier: { type: "string" },
+                          criticality: { type: "string" },
+                        },
+                        required: ["name", "description", "status"],
+                      },
+                    },
+                    total: { type: "number" },
+                    source: { type: "string" },
+                  },
+                  required: ["tools", "total", "source"],
+                },
+              },
+            },
+          },
+          "429": {
+            description: "Too Many Requests",
+          },
+        },
+      },
+    },
+    "/tasks": {
+      get: {
+        summary: "Get parsed open tasks per repo",
+        responses: {
+          "200": {
+            description: "Task payload",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      repo: { type: "string" },
+                      tasks: {
+                        type: "array",
+                        items: {
+                          type: "object",
+                          properties: {
+                            priority: { type: "string" },
+                            text: { type: "string" },
+                            done: { type: "boolean" },
+                          },
+                          required: ["priority", "text", "done"],
+                        },
+                      },
+                    },
+                    required: ["repo", "tasks"],
+                  },
+                },
+              },
+            },
+          },
+          "429": {
+            description: "Too Many Requests",
+          },
+        },
+      },
+    },
+    "/changelog": {
+      get: {
+        summary: "Get recent commit changelog",
+        responses: {
+          "200": {
+            description: "Changelog payload",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    commits: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          sha: { type: "string" },
+                          message: { type: "string" },
+                          author: { type: "string" },
+                          date: { type: "string" },
+                          url: { type: "string" },
+                        },
+                        required: ["sha", "message", "author", "date", "url"],
+                      },
+                    },
+                  },
+                  required: ["commits"],
+                },
+              },
+            },
+          },
+          "429": {
+            description: "Too Many Requests",
+          },
+        },
+      },
+    },
+    "/openapi.json": {
+      get: {
+        summary: "Get OpenAPI 3 specification",
+        responses: {
+          "200": {
+            description: "OpenAPI document",
+          },
+        },
+      },
+    },
+  },
+};
+
 type RegistryEntry = {
   repo: string;
   criticality: FleetCriticality;
@@ -52,6 +297,10 @@ type RegistryEntry = {
 type TaskPriority = "red" | "yellow" | "green";
 type RepoTask = { priority: TaskPriority; text: string; done: boolean };
 type RepoTasksPayload = { repo: string; tasks: RepoTask[] };
+type RateLimitState = {
+  count: number;
+  resetAt: number;
+};
 
 function decodeBase64(value: string): string {
   const normalized = value.replace(/\n/g, "");
@@ -71,6 +320,48 @@ function getClientIp(request: Request): string {
     return forwarded.split(",")[0]?.trim() || forwarded;
   }
   return request.headers.get("X-Real-IP") || "unknown";
+}
+
+function isPublicGetEndpoint(pathname: string): boolean {
+  return pathname !== "/set-presence" && !pathname.startsWith("/admin");
+}
+
+async function checkRateLimit(env: Env, request: Request): Promise<{ allowed: boolean; retryAfter: number }> {
+  const key = `${RATE_LIMIT_KEY_PREFIX}${getClientIp(request)}`;
+  const now = Date.now();
+  const raw = await env.CLANKA_STATE.get(key);
+  const state = safeParseJSON<RateLimitState | null>(raw, null) ?? { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+
+  const hasWindow = Number.isFinite(state.resetAt) && state.resetAt > now;
+  const validState = Number.isFinite(state.count) && state.count >= 0;
+  const current: RateLimitState = validState && hasWindow
+    ? state
+    : { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+
+  if (current.count >= RATE_LIMIT_MAX_REQUESTS) {
+    const retryAfter = Math.max(1, Math.ceil((current.resetAt - now) / 1000));
+    await env.CLANKA_STATE.put(key, JSON.stringify(current), { expirationTtl: RATE_LIMIT_WINDOW_SEC });
+    return { allowed: false, retryAfter };
+  }
+
+  const next = { ...current, count: current.count + 1 };
+  await env.CLANKA_STATE.put(key, JSON.stringify(next), { expirationTtl: RATE_LIMIT_WINDOW_SEC });
+  return { allowed: true, retryAfter: Math.max(1, Math.ceil((next.resetAt - now) / 1000)) };
+}
+
+function getStatusPayload(lastSeenRaw: string | null) {
+  const lastSeen = typeof lastSeenRaw === "string" ? Number(lastSeenRaw) : NaN;
+  const now = Date.now();
+  if (!Number.isFinite(lastSeen) || now - lastSeen > STATUS_OFFLINE_THRESHOLD_MS) {
+    return { status: "offline" };
+  }
+
+  return {
+    status: "operational",
+    timestamp: new Date().toISOString(),
+    signal: "⚡",
+    last_seen: new Date(lastSeen).toISOString(),
+  };
 }
 
 async function logRequest(env: Env, request: Request): Promise<void> {
@@ -416,6 +707,19 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
+    if (request.method === "GET" && isPublicGetEndpoint(url.pathname)) {
+      const rateLimit = await checkRateLimit(env, request);
+      if (!rateLimit.allowed) {
+        return new Response(JSON.stringify({ error: "Too Many Requests" }), {
+          status: 429,
+          headers: {
+            ...corsHeaders,
+            "Retry-After": String(rateLimit.retryAfter),
+          },
+        });
+      }
+    }
+
     // Private endpoint to set state
     if (url.pathname === "/set-presence" && request.method === "POST") {
       if (!isAuthorized(request, env)) {
@@ -488,21 +792,25 @@ export default {
 
     if (url.pathname === "/status") {
       const lastSeenRaw = await env.CLANKA_STATE.get(LAST_SEEN_KEY);
-      const lastSeen = typeof lastSeenRaw === "string" ? Number(lastSeenRaw) : NaN;
-      const now = Date.now();
-      if (!Number.isFinite(lastSeen) || now - lastSeen > STATUS_OFFLINE_THRESHOLD_MS) {
-        return new Response(JSON.stringify({ status: "offline" }), { headers: corsHeaders });
+      return new Response(JSON.stringify(getStatusPayload(lastSeenRaw)), { headers: corsHeaders });
+    }
+
+    if (url.pathname === "/health") {
+      const lastSeenRaw = await env.CLANKA_STATE.get(LAST_SEEN_KEY);
+      return new Response(JSON.stringify(getStatusPayload(lastSeenRaw)), { headers: corsHeaders });
+    }
+
+    if (url.pathname === "/openapi.json") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
       }
 
-      return new Response(
-        JSON.stringify({
-          status: "operational",
-          timestamp: new Date().toISOString(),
-          signal: "⚡",
-          last_seen: new Date(lastSeen).toISOString(),
-        }),
-        { headers: corsHeaders },
-      );
+      return new Response(JSON.stringify(OPENAPI_SPEC), {
+        headers: { ...corsHeaders },
+      });
     }
 
     if (url.pathname === "/fleet/summary") {

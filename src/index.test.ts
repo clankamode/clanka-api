@@ -269,6 +269,67 @@ describe("Unknown paths", () => {
   });
 });
 
+describe("GET /openapi.json", () => {
+  it("returns 200 and valid json", async () => {
+    const res = await worker.fetch(req("/openapi.json"), createEnv());
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body.openapi).toBe("3.0.3");
+    expect(body.paths).toBeTruthy();
+  });
+
+  it("documents public GET endpoints", async () => {
+    const res = await worker.fetch(req("/openapi.json"), createEnv());
+    const body = await json(res);
+    const paths = body.paths || {};
+    expect(Object.keys(paths).sort()).toEqual(
+      expect.arrayContaining([
+        "/status",
+        "/health",
+        "/projects",
+        "/tools",
+        "/tasks",
+        "/changelog",
+      ]),
+    );
+  });
+});
+
+describe("Rate limiting", () => {
+  it("returns 429 after 60 public GET requests in a minute", async () => {
+    const env = createEnv({ "registry:v1": JSON.stringify(MOCK_REGISTRY) });
+    const headers = { "X-Forwarded-For": "203.0.113.1" };
+
+    for (let i = 0; i < 60; i += 1) {
+      const res = await worker.fetch(req("/status", "GET", undefined, headers), env);
+      expect(res.status).toBe(200);
+    }
+
+    const limited = await worker.fetch(req("/status", "GET", undefined, headers), env);
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("Retry-After")).toBe("60");
+  });
+
+  it("allows requests after 60s window passes", async () => {
+    const now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    const env = createEnv({ "registry:v1": JSON.stringify(MOCK_REGISTRY) });
+    const headers = { "X-Forwarded-For": "198.51.100.42" };
+
+    for (let i = 0; i < 60; i += 1) {
+      const res = await worker.fetch(req("/status", "GET", undefined, headers), env);
+      expect(res.status).toBe(200);
+    }
+
+    const limited = await worker.fetch(req("/status", "GET", undefined, headers), env);
+    expect(limited.status).toBe(429);
+
+    nowSpy.mockReturnValue(now + 60_000);
+    const reset = await worker.fetch(req("/status", "GET", undefined, headers), env);
+    expect(reset.status).toBe(200);
+  });
+});
+
 describe("Auth middleware", () => {
   it("returns 401 when auth is missing", async () => {
     const res = await worker.fetch(req("/set-presence", "POST", {}), createEnv());
