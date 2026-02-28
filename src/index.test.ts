@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import worker from "./index";
 
 // Mock registry entries pre-loaded into KV so tests never hit the network
@@ -31,6 +31,10 @@ function req(path: string, method = "GET") {
 async function json(res: Response) {
   return res.json();
 }
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 // /projects
 describe("GET /projects", () => {
@@ -131,6 +135,73 @@ describe("GET /tools", () => {
 
   it("rejects non-GET with 405", async () => {
     const res = await worker.fetch(req("/tools", "POST"), createEnv());
+    expect(res.status).toBe(405);
+  });
+});
+
+// /tasks
+describe("GET /tasks", () => {
+  it("returns 200 and parsed open tasks grouped by repo", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.includes("/repos/clankamode/clanka-api/contents/TASKS.md")) {
+        const content = Buffer.from(
+          [
+            "## 🔴 Critical",
+            "- [ ] **Fix auth edge case**",
+            "## 🟢 Nice to have",
+            "- [ ] **Polish docs**",
+            "- [x] **Closed item**",
+          ].join("\n"),
+          "utf8",
+        ).toString("base64");
+        return new Response(JSON.stringify({ content }), { status: 200 });
+      }
+      if (url.includes("/repos/clankamode/ci-triage/contents/TASKS.md")) {
+        const content = Buffer.from(
+          [
+            "## 🟡 Important",
+            "- [ ] **Harden parser**",
+          ].join("\n"),
+          "utf8",
+        ).toString("base64");
+        return new Response(JSON.stringify({ content }), { status: 200 });
+      }
+      return new Response("Not Found", { status: 404 });
+    });
+
+    const res = await worker.fetch(req("/tasks"), createEnv());
+    expect(res.status).toBe(200);
+    const body = await json(res) as any[];
+    expect(Array.isArray(body)).toBe(true);
+    expect(body).toHaveLength(2);
+
+    expect(body[0]).toEqual({
+      repo: "clankamode/clanka-api",
+      tasks: [
+        { priority: "red", text: "Fix auth edge case", done: false },
+        { priority: "green", text: "Polish docs", done: false },
+      ],
+    });
+    expect(body[1]).toEqual({
+      repo: "clankamode/ci-triage",
+      tasks: [{ priority: "yellow", text: "Harden parser", done: false }],
+    });
+  });
+
+  it("returns empty task list for repos without TASKS.md", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Not Found", { status: 404 }));
+    const res = await worker.fetch(req("/tasks"), createEnv());
+    expect(res.status).toBe(200);
+    const body = await json(res) as any[];
+    expect(body).toEqual([
+      { repo: "clankamode/clanka-api", tasks: [] },
+      { repo: "clankamode/ci-triage", tasks: [] },
+    ]);
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/tasks", "POST"), createEnv());
     expect(res.status).toBe(405);
   });
 });
