@@ -47,6 +47,13 @@ describe("GET /projects", () => {
   it("response shape has projects, source, cached", async () => {
     const res = await worker.fetch(req("/projects"), createEnv());
     const body = await json(res);
+    expect(body).toEqual(
+      expect.objectContaining({
+        projects: expect.any(Array),
+        source: "registry",
+        cached: expect.any(Boolean),
+      }),
+    );
     expect(body).toHaveProperty("projects");
     expect(body).toHaveProperty("source", "registry");
     expect(body).toHaveProperty("cached");
@@ -78,6 +85,18 @@ describe("GET /projects", () => {
     expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
   });
 
+  it("returns empty projects array when registry cache is empty", async () => {
+    const res = await worker.fetch(
+      req("/projects"),
+      createEnv({ "registry:v1": JSON.stringify([]) }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body.projects).toEqual([]);
+    expect(body.source).toBe("registry");
+    expect(body.cached).toBe(true);
+  });
+
   it("rejects non-GET with 405", async () => {
     const res = await worker.fetch(req("/projects", "POST"), createEnv());
     expect(res.status).toBe(405);
@@ -99,6 +118,13 @@ describe("GET /tools", () => {
   it("response shape has tools array, total, source", async () => {
     const res = await worker.fetch(req("/tools"), createEnv());
     const body = await json(res);
+    expect(body).toEqual(
+      expect.objectContaining({
+        tools: expect.any(Array),
+        total: expect.any(Number),
+        source: "registry",
+      }),
+    );
     expect(body).toHaveProperty("tools");
     expect(body).toHaveProperty("total");
     expect(body).toHaveProperty("source", "registry");
@@ -129,6 +155,18 @@ describe("GET /tools", () => {
     expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
   });
 
+  it("returns empty tools array when registry cache is empty", async () => {
+    const res = await worker.fetch(
+      req("/tools"),
+      createEnv({ "registry:v1": JSON.stringify([]) }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body.tools).toEqual([]);
+    expect(body.total).toBe(0);
+    expect(body.source).toBe("registry");
+  });
+
   it("rejects non-GET with 405", async () => {
     const res = await worker.fetch(req("/tools", "POST"), createEnv());
     expect(res.status).toBe(405);
@@ -139,7 +177,9 @@ describe("GET /tools", () => {
 describe("Unknown paths", () => {
   it("returns 404 for unknown path", async () => {
     const res = await worker.fetch(req("/nonexistent"), createEnv());
+    const body = await json(res);
     expect(res.status).toBe(404);
+    expect(body).toEqual({ error: "Not Found" });
   });
 
   it("returns application/json Content-Type on 404", async () => {

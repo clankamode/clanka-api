@@ -3,7 +3,7 @@
 
 ## 🔴 High Priority
 - [x] **Deploy to Cloudflare** — live at https://clanka-api.clankamode.workers.dev (deployed 2026-02-26)
-- [ ] **Write tests for `/projects` and `/tools` endpoints** — added in ce0c893 but may lack test coverage. Add: response shape, empty-state, 404 on unknown paths
+- [x] **Write tests for `/projects` and `/tools` endpoints** — response shape, empty-state, 404 on unknown paths covered in `src/index.test.ts` (2026-02-28)
 - [x] **Wire `/projects` data to real source** — fetches from `assistant-tool-registry` via GitHub API, 1hr KV cache (2026-02-26)
 
 ## 🟡 Medium Priority
