@@ -24,8 +24,18 @@ function createEnv(extra: Record<string, string> = {}) {
   };
 }
 
-function req(path: string, method = "GET") {
-  return new Request(`https://api.test${path}`, { method });
+function req(
+  path: string,
+  method = "GET",
+  body?: unknown,
+  headers: Record<string, string> = {},
+) {
+  const init: RequestInit = { method, headers };
+  if (body !== undefined) {
+    init.body = JSON.stringify(body);
+    init.headers = { ...headers, "Content-Type": "application/json" };
+  }
+  return new Request(`https://api.test${path}`, init);
 }
 
 async function json(res: Response) {
@@ -256,5 +266,28 @@ describe("Unknown paths", () => {
   it("returns application/json Content-Type on 404", async () => {
     const res = await worker.fetch(req("/unknown-path"), createEnv());
     expect(res.headers.get("Content-Type")).toContain("application/json");
+  });
+});
+
+describe("Auth middleware", () => {
+  it("returns 401 when auth is missing", async () => {
+    const res = await worker.fetch(req("/set-presence", "POST", {}), createEnv());
+    expect(res.status).toBe(401);
+  });
+
+  it("returns 401 when token is invalid", async () => {
+    const res = await worker.fetch(
+      req("/set-presence", "POST", {}, { Authorization: "Bearer wrong-token" }),
+      createEnv(),
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("returns 200 when token is valid", async () => {
+    const res = await worker.fetch(
+      req("/set-presence", "POST", {}, { Authorization: "Bearer test-secret" }),
+      createEnv(),
+    );
+    expect(res.status).toBe(200);
   });
 });

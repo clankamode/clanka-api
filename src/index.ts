@@ -14,14 +14,33 @@ type HistoryEntry = { timestamp: number; desc: string; type: string; hash: strin
 type ToolStatus = "active" | "development" | "planned";
 type Tool = { name: string; description: string; status: ToolStatus; tier?: string; criticality?: string };
 type Project = { name: string; description: string; url: string; status: string; last_updated: string };
+type RequestLogEntry = { timestamp: number; method: string; pathname: string; query: string; ip: string; ua?: string };
+type ChangelogEntry = {
+  sha: string;
+  message: string;
+  author: string;
+  date: string;
+  url: string;
+};
 
 const HISTORY_LIMIT = 20;
 const REGISTRY_URL = "https://api.github.com/repos/clankamode/assistant-tool-registry/contents/registry.json";
 const REGISTRY_CACHE_KEY = "registry:v1";
 const REGISTRY_TTL_SEC = 3600; // 1 hour
 
+const REQUEST_LOG_KEY = "request_log";
+const REQUEST_LOG_TTL_SEC = 24 * 60 * 60; // 24h
+const REQUEST_LOG_LIMIT = 100;
+
+const LAST_SEEN_KEY = "last_seen";
+const STATUS_OFFLINE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+
 const GITHUB_STATS_CACHE_KEY = "github:stats:v1";
 const GITHUB_STATS_TTL_SEC = 3600; // 1 hour
+
+const CHANGELOG_CACHE_KEY = "changelog:v1";
+const CHANGELOG_TTL_SEC = 5 * 60; // 5 minutes
+const CHANGELOG_URL = "https://api.github.com/repos/clankamode/clanka/commits?per_page=10";
 
 type RegistryEntry = {
   repo: string;
@@ -42,6 +61,104 @@ function decodeBase64(value: string): string {
     return new TextDecoder().decode(bytes);
   }
   return Buffer.from(normalized, "base64").toString("utf8");
+}
+
+function getClientIp(request: Request): string {
+  const connectingIp = request.headers.get("CF-Connecting-IP");
+  if (connectingIp) return connectingIp;
+  const forwarded = request.headers.get("X-Forwarded-For");
+  if (forwarded) {
+    return forwarded.split(",")[0]?.trim() || forwarded;
+  }
+  return request.headers.get("X-Real-IP") || "unknown";
+}
+
+async function logRequest(env: Env, request: Request): Promise<void> {
+  const url = new URL(request.url);
+  const rawLog = await env.CLANKA_STATE.get(REQUEST_LOG_KEY);
+  let requestLog = safeParseJSON<unknown[]>(rawLog, []);
+  if (!Array.isArray(requestLog)) {
+    requestLog = [];
+  }
+
+  const nextLog: RequestLogEntry[] = [...requestLog, {
+    timestamp: Date.now(),
+    method: request.method,
+    pathname: url.pathname,
+    query: url.search,
+    ip: getClientIp(request),
+    ua: request.headers.get("User-Agent") || undefined,
+  }];
+  const trimmedLog = nextLog.length > REQUEST_LOG_LIMIT ? nextLog.slice(-REQUEST_LOG_LIMIT) : nextLog;
+
+  await env.CLANKA_STATE.put(REQUEST_LOG_KEY, JSON.stringify(trimmedLog), {
+    expirationTtl: REQUEST_LOG_TTL_SEC,
+  });
+}
+
+function isAuthorized(request: Request, env: Env): boolean {
+  const auth = request.headers.get("Authorization");
+  const expected = `Bearer ${env.ADMIN_KEY}`;
+  return auth === expected;
+}
+
+async function loadChangelog(env: Env): Promise<ChangelogEntry[]> {
+  const cached = await env.CLANKA_STATE.get(CHANGELOG_CACHE_KEY);
+  if (cached) {
+    try {
+      return JSON.parse(cached) as ChangelogEntry[];
+    } catch {
+      // fall through to fetch
+    }
+  }
+
+  const headers: Record<string, string> = {
+    "User-Agent": "clanka-api/1.0",
+    "Accept": "application/vnd.github.v3+json",
+  };
+
+  const res = await fetch(CHANGELOG_URL, { headers });
+  if (!res.ok) return [];
+
+  const body = await res.json() as unknown;
+  if (!Array.isArray(body)) return [];
+
+  const payload = body
+    .slice(0, 10)
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const commitInfo = (item as { commit?: { message?: string; author?: { name?: string; date?: string }; committer?: { date?: string } }; author?: { login?: string }; sha?: string; html_url?: string });
+      const commit = commitInfo.commit || {};
+      const commitAuthor = commitInfo.author;
+      const htmlUrl = typeof commitInfo.html_url === "string" ? commitInfo.html_url : "";
+      const sha = typeof commitInfo.sha === "string" ? commitInfo.sha : "";
+      const message = typeof commit.message === "string" ? commit.message : "";
+      const author = typeof commitAuthor?.login === "string"
+        ? commitAuthor.login
+        : typeof commit.author?.name === "string"
+          ? commit.author.name
+          : "unknown";
+      const date = typeof commit.author?.date === "string"
+        ? commit.author.date
+        : typeof commit.committer?.date === "string"
+          ? commit.committer.date
+          : new Date().toISOString();
+
+      if (!sha) return null;
+      return {
+        sha,
+        message,
+        author,
+        date,
+        url: htmlUrl || `https://github.com/clankamode/clanka/commit/${sha}`,
+      };
+    })
+    .filter((entry): entry is ChangelogEntry => Boolean(entry));
+
+  await env.CLANKA_STATE.put(CHANGELOG_CACHE_KEY, JSON.stringify(payload), {
+    expirationTtl: CHANGELOG_TTL_SEC,
+  });
+  return payload;
 }
 
 async function loadRegistryEntries(env: Env): Promise<RegistryEntry[]> {
@@ -289,15 +406,19 @@ export default {
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
     };
 
+    try {
+      await logRequest(env, request);
+    } catch {
+      // ignore logging errors
+    }
+
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders });
     }
 
     // Private endpoint to set state
     if (url.pathname === "/set-presence" && request.method === "POST") {
-      const auth = request.headers.get("Authorization");
-      const expected = `Bearer ${env.ADMIN_KEY}`;
-      if (auth !== expected) {
+      if (!isAuthorized(request, env)) {
         // Log failed auth attempt for audit
         try {
           const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || 'unknown';
@@ -338,8 +459,11 @@ export default {
         await env.CLANKA_STATE.put("history", JSON.stringify(history.slice(0, HISTORY_LIMIT)));
       }
 
+      const now = Date.now();
+      await env.CLANKA_STATE.put(LAST_SEEN_KEY, String(now));
+
       if (state) {
-        await env.CLANKA_STATE.put("presence", JSON.stringify({ state, message, timestamp: Date.now() }), {
+        await env.CLANKA_STATE.put("presence", JSON.stringify({ state, message, timestamp: now }), {
           expirationTtl: ttl || 1800 
         });
       }
@@ -363,11 +487,22 @@ export default {
     }
 
     if (url.pathname === "/status") {
-      return new Response(JSON.stringify({ 
-        status: "operational", 
-        timestamp: new Date().toISOString(),
-        signal: "⚡" 
-      }), { headers: corsHeaders });
+      const lastSeenRaw = await env.CLANKA_STATE.get(LAST_SEEN_KEY);
+      const lastSeen = typeof lastSeenRaw === "string" ? Number(lastSeenRaw) : NaN;
+      const now = Date.now();
+      if (!Number.isFinite(lastSeen) || now - lastSeen > STATUS_OFFLINE_THRESHOLD_MS) {
+        return new Response(JSON.stringify({ status: "offline" }), { headers: corsHeaders });
+      }
+
+      return new Response(
+        JSON.stringify({
+          status: "operational",
+          timestamp: new Date().toISOString(),
+          signal: "⚡",
+          last_seen: new Date(lastSeen).toISOString(),
+        }),
+        { headers: corsHeaders },
+      );
     }
 
     if (url.pathname === "/fleet/summary") {
@@ -448,9 +583,7 @@ export default {
 
     // Tasks CRUD (admin only)
     if (url.pathname === "/admin/tasks") {
-      const auth = request.headers.get("Authorization");
-      const expected = `Bearer ${env.ADMIN_KEY}`;
-      if (auth !== expected) {
+      if (!isAuthorized(request, env)) {
         return new Response('Unauthorized', { status: 401 });
       }
 
@@ -489,9 +622,7 @@ export default {
     }
 
     if (url.pathname === "/admin/activity") {
-      const auth = request.headers.get("Authorization");
-      const expected = `Bearer ${env.ADMIN_KEY}`;
-      if (auth !== expected) {
+      if (!isAuthorized(request, env)) {
         return new Response("Unauthorized", { status: 401 });
       }
 
@@ -634,6 +765,18 @@ export default {
       }
       const events = await loadGithubEvents(env.CLANKA_STATE);
       return new Response(JSON.stringify({ events }), { headers: corsHeaders });
+    }
+
+    if (url.pathname === "/changelog") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const commits = await loadChangelog(env);
+      return new Response(JSON.stringify({ commits }), { headers: corsHeaders });
     }
 
     if (url.pathname === "/posts/count") {
