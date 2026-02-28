@@ -393,6 +393,60 @@ function isAuthorized(request: Request, env: Env): boolean {
   return auth === expected;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+async function parseJsonBody(request: Request): Promise<{ ok: true; value: unknown } | { ok: false }> {
+  const raw = await request.text();
+  if (!raw.trim()) {
+    return { ok: true, value: {} };
+  }
+
+  try {
+    return { ok: true, value: JSON.parse(raw) as unknown };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function normalizePresence(value: unknown): { state: string; message?: string } | null {
+  if (typeof value === "string") {
+    const state = value.trim();
+    return state ? { state } : null;
+  }
+
+  if (!isPlainObject(value)) {
+    return null;
+  }
+
+  const state = typeof value.state === "string" ? value.state.trim() : "";
+  if (!state) {
+    return null;
+  }
+  const message = typeof value.message === "string" ? value.message.trim() : "";
+  return { state, message: message || undefined };
+}
+
+function normalizeTeam(value: unknown): Record<string, unknown> | null {
+  if (!isPlainObject(value)) {
+    return null;
+  }
+  return Object.keys(value).length > 0 ? value : null;
+}
+
+function normalizeActivityInput(value: unknown): { desc: string; type: string } | null {
+  if (!isPlainObject(value)) {
+    return null;
+  }
+  const desc = typeof value.desc === "string" ? value.desc.trim() : "";
+  const type = typeof value.type === "string" ? value.type.trim() : "";
+  if (!desc || !type) {
+    return null;
+  }
+  return { desc, type };
+}
+
 async function loadChangelog(env: Env): Promise<ChangelogEntry[]> {
   const cached = await env.CLANKA_STATE.get(CHANGELOG_CACHE_KEY);
   if (cached) {
@@ -735,42 +789,63 @@ export default {
         return new Response(`Unauthorized`, { status: 401 });
       }
 
-      const { state, message, ttl, activity, team, tasks } = await request.json() as {
-        state?: string;
-        message?: string;
-        ttl?: number;
-        activity?: unknown;
-        team?: Record<string, unknown>;
-        tasks?: unknown;
-      };
-
-      if (tasks) {
-        await env.CLANKA_STATE.put("tasks", JSON.stringify(tasks));
+      const parsedBody = await parseJsonBody(request);
+      if (!parsedBody.ok) {
+        return new Response(JSON.stringify({ error: "Invalid body: expected JSON object" }), {
+          status: 400,
+          headers: corsHeaders,
+        });
+      }
+      if (!isPlainObject(parsedBody.value)) {
+        return new Response(
+          JSON.stringify({ error: "Invalid body: required non-empty presence, team, and activity fields" }),
+          {
+            status: 400,
+            headers: corsHeaders,
+          },
+        );
+      }
+      const body = parsedBody.value;
+      const presence = normalizePresence(body.presence);
+      const team = normalizeTeam(body.team);
+      const activity = normalizeActivityInput(body.activity);
+      if (!presence || !team || !activity) {
+        return new Response(
+          JSON.stringify({ error: "Invalid body: required non-empty presence, team, and activity fields" }),
+          {
+            status: 400,
+            headers: corsHeaders,
+          },
+        );
       }
 
-      if (team) {
-        const currentTeamRaw = await env.CLANKA_STATE.get("team") || "{}";
-        const currentTeam = safeParseJSON<Record<string, unknown>>(currentTeamRaw, {});
-        const updatedTeam = { ...currentTeam, ...team };
-        await env.CLANKA_STATE.put("team", JSON.stringify(updatedTeam));
+      if ("tasks" in body && body.tasks !== undefined) {
+        await env.CLANKA_STATE.put("tasks", JSON.stringify(body.tasks));
       }
 
-      if (activity) {
-        const historyRaw = await env.CLANKA_STATE.get("history") || "[]";
-        const history = normalizeHistory(safeParseJSON<unknown[]>(historyRaw, []));
-        const entry = toHistoryEntry(activity, Date.now());
-        history.unshift(entry);
-        await env.CLANKA_STATE.put("history", JSON.stringify(history.slice(0, HISTORY_LIMIT)));
-      }
+      const currentTeamRaw = await env.CLANKA_STATE.get("team") || "{}";
+      const currentTeam = safeParseJSON<Record<string, unknown>>(currentTeamRaw, {});
+      const updatedTeam = { ...currentTeam, ...team };
+      await env.CLANKA_STATE.put("team", JSON.stringify(updatedTeam));
+
+      const historyRaw = await env.CLANKA_STATE.get("history") || "[]";
+      const history = normalizeHistory(safeParseJSON<unknown[]>(historyRaw, []));
+      const entry = toHistoryEntry(activity, Date.now());
+      history.unshift(entry);
+      await env.CLANKA_STATE.put("history", JSON.stringify(history.slice(0, HISTORY_LIMIT)));
 
       const now = Date.now();
       await env.CLANKA_STATE.put(LAST_SEEN_KEY, String(now));
 
-      if (state) {
-        await env.CLANKA_STATE.put("presence", JSON.stringify({ state, message, timestamp: now }), {
-          expirationTtl: ttl || 1800 
-        });
-      }
+      const ttl = typeof body.ttl === "number" && Number.isFinite(body.ttl) && body.ttl > 0
+        ? body.ttl
+        : 1800;
+      const message = presence.message
+        || (typeof body.message === "string" ? body.message.trim() : "")
+        || undefined;
+      await env.CLANKA_STATE.put("presence", JSON.stringify({ state: presence.state, message, timestamp: now }), {
+        expirationTtl: ttl,
+      });
       return new Response(JSON.stringify({ success: true }), { headers: corsHeaders });
     }
 
@@ -793,6 +868,32 @@ export default {
     if (url.pathname === "/status") {
       const lastSeenRaw = await env.CLANKA_STATE.get(LAST_SEEN_KEY);
       return new Response(JSON.stringify(getStatusPayload(lastSeenRaw)), { headers: corsHeaders });
+    }
+
+    if (url.pathname === "/status/uptime") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const [lastSeenRaw, startedRaw] = await Promise.all([
+        env.CLANKA_STATE.get(LAST_SEEN_KEY),
+        env.CLANKA_STATE.get("started"),
+      ]);
+      const now = Date.now();
+      let started = Number(startedRaw);
+      if (!Number.isFinite(started) || started <= 0 || started > now) {
+        started = now;
+        await env.CLANKA_STATE.put("started", String(started));
+      }
+
+      const payload = {
+        ...getStatusPayload(lastSeenRaw),
+        uptime_ms: Math.max(0, now - started),
+      };
+      return new Response(JSON.stringify(payload), { headers: corsHeaders });
     }
 
     if (url.pathname === "/health") {
@@ -868,25 +969,83 @@ export default {
         });
       }
 
-      const [presenceRaw, historyRaw, teamRaw] = await Promise.all([
+      const [presenceRaw, historyRaw, teamRaw, lastSeenRaw] = await Promise.all([
         env.CLANKA_STATE.get("presence"),
         env.CLANKA_STATE.get("history"),
         env.CLANKA_STATE.get("team"),
+        env.CLANKA_STATE.get(LAST_SEEN_KEY),
       ]);
       const presence = safeParseJSON<{ state?: string; timestamp?: number } | null>(presenceRaw, null);
       const history = normalizeHistory(safeParseJSON<unknown[]>(historyRaw || "[]", []));
       const team = safeParseJSON<unknown>(teamRaw || "{}", {});
       const agentsActive = countActiveAgents(team);
+      const fromLastSeen = typeof lastSeenRaw === "string" ? Number(lastSeenRaw) : NaN;
+      const fromPresence = typeof presence?.timestamp === "number" ? presence.timestamp : NaN;
+      const lastSeenMs = Number.isFinite(fromLastSeen)
+        ? fromLastSeen
+        : Number.isFinite(fromPresence)
+          ? fromPresence
+          : Date.now();
 
       return new Response(
         JSON.stringify({
           ts: new Date().toISOString(),
           status: presence?.state || "active",
+          signal: "⚡",
+          last_seen: new Date(lastSeenMs).toISOString(),
           agents_active: agentsActive,
           last_event_desc: history[0]?.desc || null,
         }),
         { headers: corsHeaders },
       );
+    }
+
+    if (url.pathname === "/heartbeat") {
+      if (!isAuthorized(request, env)) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      if (request.method !== "POST") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const parsedBody = await parseJsonBody(request);
+      if (!parsedBody.ok || !isPlainObject(parsedBody.value)) {
+        return new Response(JSON.stringify({ error: "Invalid body: expected JSON object" }), {
+          status: 400,
+          headers: corsHeaders,
+        });
+      }
+      const body = parsedBody.value;
+
+      if ("history" in body && !Array.isArray(body.history)) {
+        return new Response(JSON.stringify({ error: "Invalid body: history must be an array" }), {
+          status: 400,
+          headers: corsHeaders,
+        });
+      }
+
+      const now = Date.now();
+      await env.CLANKA_STATE.put(LAST_SEEN_KEY, String(now));
+
+      const nextEntries: HistoryEntry[] = [];
+      if (Array.isArray(body.history)) {
+        nextEntries.push(...normalizeHistory(body.history));
+      }
+      if ("activity" in body && body.activity !== undefined) {
+        nextEntries.unshift(toHistoryEntry(body.activity, now));
+      }
+      if (nextEntries.length > 0) {
+        const historyRaw = await env.CLANKA_STATE.get("history") || "[]";
+        const history = normalizeHistory(safeParseJSON<unknown[]>(historyRaw, []));
+        const merged = [...nextEntries, ...history].slice(0, HISTORY_LIMIT);
+        await env.CLANKA_STATE.put("history", JSON.stringify(merged));
+      }
+
+      return new Response(JSON.stringify({ success: true, timestamp: now }), { headers: corsHeaders });
     }
 
     // Tasks CRUD (admin only)
@@ -1024,27 +1183,35 @@ export default {
     }
 
     if (url.pathname === "/now") {
-      const [presenceRaw, historyRaw, teamRaw, startedRaw] = await Promise.all([
+      const [presenceRaw, historyRaw, teamRaw, startedRaw, lastSeenRaw] = await Promise.all([
         env.CLANKA_STATE.get("presence"),
         env.CLANKA_STATE.get("history"),
         env.CLANKA_STATE.get("team"),
         env.CLANKA_STATE.get("started"),
+        env.CLANKA_STATE.get(LAST_SEEN_KEY),
       ]);
       const now = Date.now();
       const presence = safeParseJSON<{ state?: string; message?: string; timestamp?: number } | null>(presenceRaw, null);
       const history = normalizeHistory(safeParseJSON<unknown[]>(historyRaw || "[]", []));
       const team = safeParseJSON<unknown>(teamRaw || "{}", {});
       let started = Number(startedRaw);
-      if (!Number.isFinite(started)) {
+      if (!Number.isFinite(started) || started <= 0 || started > now) {
         started = now;
         await env.CLANKA_STATE.put("started", String(started));
       }
       const agentsActive = countActiveAgents(team);
-      const lastSeenMs = typeof presence?.timestamp === "number" ? presence.timestamp : now;
+      const fromLastSeen = typeof lastSeenRaw === "string" ? Number(lastSeenRaw) : NaN;
+      const fromPresence = typeof presence?.timestamp === "number" ? presence.timestamp : NaN;
+      const lastSeenMs = Number.isFinite(fromLastSeen)
+        ? fromLastSeen
+        : Number.isFinite(fromPresence)
+          ? fromPresence
+          : now;
 
       return new Response(JSON.stringify({
         current: presence?.message || "monitoring workspace and building public signals",
         status: presence?.state || "active",
+        signal: "⚡",
         stack: ["Cloudflare Workers", "TypeScript", "Lit"],
         timestamp: lastSeenMs,
         uptime: Math.max(0, now - started),

@@ -1,16 +1,20 @@
 # TASKS.md — clanka-api
-> Last updated: 2026-02-25 | Status: open
+> Last updated: 2026-02-28 | Status: open
 
 ## 🔴 High Priority
 - [x] **Deploy to Cloudflare** — live at https://clanka-api.clankamode.workers.dev (deployed 2026-02-26)
 - [x] **Write tests for `/projects` and `/tools` endpoints** — response shape, empty-state, 404 on unknown paths covered in `src/index.test.ts` (2026-02-28)
 - [x] **Wire `/projects` data to real source** — fetches from `assistant-tool-registry` via GitHub API, 1hr KV cache (2026-02-26)
+- [x] **Add POST endpoint coverage for `/set-presence`** — strict required payload validation tests for `presence`, `team`, and `activity`; empty/null payloads return 400 (2026-02-28)
+- [x] **Add POST coverage for `/heartbeat` and `/admin/activity`** — 200 success, 401 missing/invalid auth, malformed payload guardrails (2026-02-28)
+- [x] **Add regression tests for `/status` and `/status/uptime`** — online/offline threshold behavior locked around `LAST_SEEN_KEY` and `STATUS_OFFLINE_THRESHOLD_MS` (2026-02-28)
 
 ## 🟡 Medium Priority
 - [x] **Add `/tasks` endpoint** — reads `TASKS.md` from each registered repo, parses open checkboxes, returns `{ repo, tasks: [{ priority, text, done }] }[]` (completed 2026-02-28)
 - [x] **Add auth middleware tests** — test: missing auth → 401, wrong token → 401, correct token → 200
 - [x] **Add request logging** — log each request to KV list with TTL; max 100 entries rolling
 - [x] **KV TTL on presence** — if no heartbeat in 10 min, `/status` returns `{ status: "offline" }`
+- [x] **Add contract tests for `/now` and `/pulse`** — exact response shape assertions with deterministic `status`, `last_seen`, and `signal` fields (2026-02-28)
 
 ## 🟢 Low Priority / Nice to Have
 - [x] **`/changelog` endpoint** — last 10 git commits from key repos via GitHub API
