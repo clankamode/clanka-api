@@ -3,6 +3,7 @@ import { loadGithubEvents } from "./github-events";
 export interface Env {
   CLANKA_STATE: KVNamespace;
   ADMIN_KEY: string;
+  ADMIN_TOKEN?: string;
   GITHUB_TOKEN?: string;
 }
 
@@ -65,12 +66,16 @@ const RATE_LIMIT_KEY_PREFIX = "rate_limit:ip:";
 const RATE_LIMIT_WINDOW_SEC = 60;
 const RATE_LIMIT_WINDOW_MS = RATE_LIMIT_WINDOW_SEC * 1000;
 const RATE_LIMIT_MAX_REQUESTS = 60;
+const METRICS_KEY = "metrics:v1";
+const API_VERSION = "1.0.0";
+const STATUS_ENDPOINTS = ["/", "/fleet/summary", "/fleet/health", "/history", "/now", "/status", "/metrics"];
+const startTime = Date.now();
 
 const OPENAPI_SPEC = {
   openapi: "3.0.3",
   info: {
     title: "clanka-api",
-    version: "1.0.0",
+    version: API_VERSION,
     description: "Edge API for Clanka public endpoints",
   },
   paths: {
@@ -361,6 +366,20 @@ type RateLimitState = {
   count: number;
   resetAt: number;
 };
+type MetricsState = {
+  requests_total: number;
+  kv_hits: number;
+  kv_misses: number;
+};
+type WorkerExecutionContext = {
+  waitUntil(promise: Promise<unknown>): void;
+};
+
+const inMemoryMetrics: MetricsState = {
+  requests_total: 0,
+  kv_hits: 0,
+  kv_misses: 0,
+};
 
 function decodeBase64(value: string): string {
   const normalized = value.replace(/\n/g, "");
@@ -383,7 +402,7 @@ function getClientIp(request: Request): string {
 }
 
 function isPublicGetEndpoint(pathname: string): boolean {
-  return pathname !== "/set-presence" && !pathname.startsWith("/admin");
+  return pathname !== "/set-presence" && pathname !== "/metrics" && !pathname.startsWith("/admin");
 }
 
 async function checkRateLimit(env: Env, request: Request): Promise<{ allowed: boolean; retryAfter: number }> {
@@ -407,6 +426,79 @@ async function checkRateLimit(env: Env, request: Request): Promise<{ allowed: bo
   const next = { ...current, count: current.count + 1 };
   await env.CLANKA_STATE.put(key, JSON.stringify(next), { expirationTtl: RATE_LIMIT_WINDOW_SEC });
   return { allowed: true, retryAfter: Math.max(1, Math.ceil((next.resetAt - now) / 1000)) };
+}
+
+function toCounter(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
+  return Math.floor(value);
+}
+
+function parseMetricsState(raw: string | null): MetricsState {
+  if (!raw) {
+    return { requests_total: 0, kv_hits: 0, kv_misses: 0 };
+  }
+
+  const parsed = safeParseJSON<unknown>(raw, null);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { requests_total: 0, kv_hits: 0, kv_misses: 0 };
+  }
+
+  const item = parsed as Record<string, unknown>;
+  return {
+    requests_total: toCounter(item.requests_total),
+    kv_hits: toCounter(item.kv_hits),
+    kv_misses: toCounter(item.kv_misses),
+  };
+}
+
+function mergeMetricsState(a: MetricsState, b: MetricsState): MetricsState {
+  return {
+    requests_total: Math.max(a.requests_total, b.requests_total),
+    kv_hits: Math.max(a.kv_hits, b.kv_hits),
+    kv_misses: Math.max(a.kv_misses, b.kv_misses),
+  };
+}
+
+async function incrementMetrics(env: Env): Promise<void> {
+  inMemoryMetrics.requests_total += 1;
+  if (!env.CLANKA_STATE || typeof env.CLANKA_STATE.get !== "function" || typeof env.CLANKA_STATE.put !== "function") {
+    inMemoryMetrics.kv_misses += 1;
+    return;
+  }
+
+  try {
+    const raw = await env.CLANKA_STATE.get(METRICS_KEY);
+    const persisted = parseMetricsState(raw);
+    const hasPersistedMetrics = typeof raw === "string" && raw.length > 0;
+    const next = mergeMetricsState(inMemoryMetrics, {
+      requests_total: persisted.requests_total + 1,
+      kv_hits: persisted.kv_hits + (hasPersistedMetrics ? 1 : 0),
+      kv_misses: persisted.kv_misses + (hasPersistedMetrics ? 0 : 1),
+    });
+
+    inMemoryMetrics.requests_total = next.requests_total;
+    inMemoryMetrics.kv_hits = next.kv_hits;
+    inMemoryMetrics.kv_misses = next.kv_misses;
+    await env.CLANKA_STATE.put(METRICS_KEY, JSON.stringify(next));
+  } catch {
+    inMemoryMetrics.kv_misses += 1;
+  }
+}
+
+async function loadMetrics(env: Env): Promise<MetricsState> {
+  if (!env.CLANKA_STATE || typeof env.CLANKA_STATE.get !== "function") {
+    return { ...inMemoryMetrics };
+  }
+
+  try {
+    const raw = await env.CLANKA_STATE.get(METRICS_KEY);
+    if (!raw) {
+      return { ...inMemoryMetrics };
+    }
+    return mergeMetricsState(inMemoryMetrics, parseMetricsState(raw));
+  } catch {
+    return { ...inMemoryMetrics };
+  }
 }
 
 function getStatusPayload(lastSeenRaw: string | null) {
@@ -1053,7 +1145,7 @@ function countActiveAgents(team: unknown): number {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: WorkerExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // Helper for CORS headers
@@ -1061,8 +1153,19 @@ export default {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Token",
     };
+    const noCacheHeaders = {
+      ...corsHeaders,
+      "Cache-Control": "no-store",
+    };
+
+    const metricsUpdate = incrementMetrics(env);
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(metricsUpdate);
+    } else {
+      void metricsUpdate;
+    }
 
     try {
       await logRequest(env, request);
@@ -1243,8 +1346,53 @@ export default {
     }
 
     if (url.pathname === "/status") {
-      const lastSeenRaw = await env.CLANKA_STATE.get(LAST_SEEN_KEY);
-      return new Response(JSON.stringify(getStatusPayload(lastSeenRaw)), { headers: corsHeaders });
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      return new Response(JSON.stringify({
+        ok: true,
+        version: API_VERSION,
+        timestamp: new Date().toISOString(),
+        endpoints: STATUS_ENDPOINTS,
+      }), { headers: noCacheHeaders });
+    }
+
+    if (url.pathname === "/metrics") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const expectedToken = typeof env.ADMIN_TOKEN === "string" ? env.ADMIN_TOKEN.trim() : "";
+      if (!expectedToken) {
+        return new Response(JSON.stringify({ error: "metrics_unavailable" }), {
+          status: 503,
+          headers: noCacheHeaders,
+        });
+      }
+
+      const providedToken = request.headers.get("X-Admin-Token");
+      if (providedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "unauthorized" }), {
+          status: 401,
+          headers: noCacheHeaders,
+        });
+      }
+
+      const metrics = await loadMetrics(env);
+      return new Response(JSON.stringify({
+        uptime_ms: Math.max(0, Date.now() - startTime),
+        requests_total: metrics.requests_total,
+        kv_hits: metrics.kv_hits,
+        kv_misses: metrics.kv_misses,
+        timestamp: new Date().toISOString(),
+      }), { headers: noCacheHeaders });
     }
 
     if (url.pathname === "/status/uptime") {
