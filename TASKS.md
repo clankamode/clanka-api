@@ -28,6 +28,7 @@
 - [x] Add `/fleet/health` endpoint with 5-minute KV cache and graceful GitHub failure fallback (stale cache or 503), plus endpoint tests for success/stale/503 paths. (completed 2026-03-01)
 - [x] Upgrade `/fleet/health` CI checks to poll GitHub Actions runs with per-repo KV cache (`ci:<repo>:v1`, 10m TTL), token-less fallback to `UNKNOWN`, and expanded endpoint tests. (completed 2026-03-01)
 - [x] Add `GET /status` contract payload and admin-gated `GET /metrics` endpoint (`X-Admin-Token`) with KV-backed counters + fallback behavior, plus vitest coverage. (completed 2026-03-01)
+- [x] Add `/tools` + `/changelog` endpoint contract updates: `/tools` returns registry entries with `count/cached/timestamp` (5m KV cache), and `/changelog` now reads `clankamode/meta-runner` commits with `GITHUB_TOKEN` + 10m KV cache and no-token fallback; test suite now at 96 passing tests. (completed 2026-03-01)
 - [ ] Add endpoint coverage for `/history` query behavior in `src/index.test.ts` (e.g., default limit, explicit limit clamping, and reverse-chronological ordering).
 - [ ] Add docs in `README.md` for admin APIs (`/set-presence`, `/heartbeat`, `/admin/activity`, `/admin/tasks`) with request/response examples and required `Bearer` token flow.
 
