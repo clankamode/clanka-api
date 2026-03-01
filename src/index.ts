@@ -24,8 +24,6 @@ type FleetHealthPayload = {
 };
 type HistoryEntry = { timestamp: number; desc: string; type: string; hash: string };
 
-type ToolStatus = "active" | "development" | "planned";
-type Tool = { name: string; description: string; status: ToolStatus; tier?: string; criticality?: string };
 type Project = { name: string; description: string; url: string; status: string; last_updated: string };
 type RequestLogEntry = { timestamp: number; method: string; pathname: string; query: string; ip: string; ua?: string };
 type ChangelogEntry = {
@@ -33,7 +31,6 @@ type ChangelogEntry = {
   message: string;
   author: string;
   date: string;
-  url: string;
 };
 
 const HISTORY_LIMIT = 20;
@@ -42,6 +39,7 @@ const REGISTRY_CACHE_KEY = "registry:v1";
 const REGISTRY_STALE_CACHE_KEY = `${REGISTRY_CACHE_KEY}:stale`;
 const REGISTRY_TTL_SEC = 3600; // 1 hour
 const REGISTRY_STALE_TTL_SEC = 7 * 24 * 60 * 60; // 7 days
+const TOOLS_REGISTRY_TTL_SEC = 5 * 60; // 5 minutes
 
 const REQUEST_LOG_KEY = "request_log";
 const REQUEST_LOG_TTL_SEC = 24 * 60 * 60; // 24h
@@ -53,9 +51,9 @@ const STATUS_OFFLINE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
 const GITHUB_STATS_CACHE_KEY = "github:stats:v1";
 const GITHUB_STATS_TTL_SEC = 3600; // 1 hour
 
-const CHANGELOG_CACHE_KEY = "changelog:v1";
-const CHANGELOG_TTL_SEC = 5 * 60; // 5 minutes
-const CHANGELOG_URL = "https://api.github.com/repos/clankamode/clanka/commits?per_page=10";
+const CHANGELOG_CACHE_KEY = "changelog:meta-runner:v1";
+const CHANGELOG_TTL_SEC = 10 * 60; // 10 minutes
+const CHANGELOG_URL = "https://api.github.com/repos/clankamode/meta-runner/commits?per_page=10";
 
 const FLEET_HEALTH_CACHE_KEY = "fleet:health:v1";
 const FLEET_HEALTH_TTL_SEC = 5 * 60; // 5 minutes
@@ -199,19 +197,19 @@ const OPENAPI_SPEC = {
                       items: {
                         type: "object",
                         properties: {
-                          name: { type: "string" },
+                          repo: { type: "string" },
                           description: { type: "string" },
-                          status: { type: "string" },
                           tier: { type: "string" },
                           criticality: { type: "string" },
                         },
-                        required: ["name", "description", "status"],
+                        required: ["repo", "description", "tier", "criticality"],
                       },
                     },
-                    total: { type: "number" },
-                    source: { type: "string" },
+                    count: { type: "number" },
+                    cached: { type: "boolean" },
+                    timestamp: { type: "string" },
                   },
-                  required: ["tools", "total", "source"],
+                  required: ["tools", "count", "cached", "timestamp"],
                 },
               },
             },
@@ -322,13 +320,14 @@ const OPENAPI_SPEC = {
                           message: { type: "string" },
                           author: { type: "string" },
                           date: { type: "string" },
-                          url: { type: "string" },
                         },
-                        required: ["sha", "message", "author", "date", "url"],
+                        required: ["sha", "message", "author", "date"],
                       },
                     },
+                    timestamp: { type: "string" },
+                    error: { type: "string" },
                   },
-                  required: ["commits"],
+                  required: ["commits", "timestamp"],
                 },
               },
             },
@@ -563,20 +562,81 @@ function isAuthorized(request: Request, env: Env): boolean {
   return auth === expected;
 }
 
-async function loadChangelog(env: Env): Promise<ChangelogEntry[]> {
-  const cached = await env.CLANKA_STATE.get(CHANGELOG_CACHE_KEY);
-  if (cached) {
-    try {
-      return JSON.parse(cached) as ChangelogEntry[];
-    } catch {
-      // fall through to fetch
-    }
+function normalizeChangelogEntry(entry: unknown): ChangelogEntry | null {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+
+  const item = entry as {
+    sha?: unknown;
+    message?: unknown;
+    author?: unknown;
+    date?: unknown;
+    commit?: {
+      message?: unknown;
+      author?: { name?: unknown; date?: unknown };
+      committer?: { date?: unknown };
+    };
+  };
+
+  const directSha = typeof item.sha === "string" ? item.sha.trim() : "";
+  const directMessage = typeof item.message === "string" ? item.message : "";
+  const directAuthor = typeof item.author === "string" ? item.author : "";
+  const directDate = typeof item.date === "string" ? item.date : "";
+  if (directSha && directMessage && directAuthor && directDate) {
+    return {
+      sha: directSha,
+      message: directMessage,
+      author: directAuthor,
+      date: directDate,
+    };
   }
+
+  const commit = item.commit && typeof item.commit === "object" && !Array.isArray(item.commit)
+    ? item.commit
+    : undefined;
+  const message = typeof commit?.message === "string" ? commit.message : "";
+  const author = item.author && typeof item.author === "object" && !Array.isArray(item.author)
+    && typeof (item.author as { login?: unknown }).login === "string"
+    ? (item.author as { login: string }).login
+    : typeof commit?.author?.name === "string"
+      ? commit.author.name
+      : "unknown";
+  const date = typeof commit?.author?.date === "string"
+    ? commit.author.date
+    : typeof commit?.committer?.date === "string"
+      ? commit.committer.date
+      : new Date().toISOString();
+  if (!directSha) return null;
+  return {
+    sha: directSha,
+    message,
+    author,
+    date,
+  };
+}
+
+function parseChangelogEntries(raw: string | null): ChangelogEntry[] | null {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return null;
+    return parsed
+      .slice(0, 10)
+      .map((entry) => normalizeChangelogEntry(entry))
+      .filter((entry): entry is ChangelogEntry => Boolean(entry));
+  } catch {
+    return null;
+  }
+}
+
+async function loadChangelog(env: Env): Promise<ChangelogEntry[]> {
+  const cached = parseChangelogEntries(await env.CLANKA_STATE.get(CHANGELOG_CACHE_KEY));
+  if (cached !== null) return cached;
 
   const headers: Record<string, string> = {
     "User-Agent": "clanka-api/1.0",
     "Accept": "application/vnd.github.v3+json",
   };
+  if (env.GITHUB_TOKEN) headers["Authorization"] = `Bearer ${env.GITHUB_TOKEN}`;
 
   const res = await fetch(CHANGELOG_URL, { headers });
   if (!res.ok) return [];
@@ -586,34 +646,7 @@ async function loadChangelog(env: Env): Promise<ChangelogEntry[]> {
 
   const payload = body
     .slice(0, 10)
-    .map((item) => {
-      if (!item || typeof item !== "object") return null;
-      const commitInfo = (item as { commit?: { message?: string; author?: { name?: string; date?: string }; committer?: { date?: string } }; author?: { login?: string }; sha?: string; html_url?: string });
-      const commit = commitInfo.commit || {};
-      const commitAuthor = commitInfo.author;
-      const htmlUrl = typeof commitInfo.html_url === "string" ? commitInfo.html_url : "";
-      const sha = typeof commitInfo.sha === "string" ? commitInfo.sha : "";
-      const message = typeof commit.message === "string" ? commit.message : "";
-      const author = typeof commitAuthor?.login === "string"
-        ? commitAuthor.login
-        : typeof commit.author?.name === "string"
-          ? commit.author.name
-          : "unknown";
-      const date = typeof commit.author?.date === "string"
-        ? commit.author.date
-        : typeof commit.committer?.date === "string"
-          ? commit.committer.date
-          : new Date().toISOString();
-
-      if (!sha) return null;
-      return {
-        sha,
-        message,
-        author,
-        date,
-        url: htmlUrl || `https://github.com/clankamode/clanka/commit/${sha}`,
-      };
-    })
+    .map((entry) => normalizeChangelogEntry(entry))
     .filter((entry): entry is ChangelogEntry => Boolean(entry));
 
   await env.CLANKA_STATE.put(CHANGELOG_CACHE_KEY, JSON.stringify(payload), {
@@ -729,6 +762,37 @@ async function loadRegistryEntries(env: Env): Promise<RegistryEntry[]> {
     return entries;
   } catch {
     return staleEntries ?? [];
+  }
+}
+
+async function loadToolsRegistryEntries(env: Env): Promise<{ entries: RegistryEntry[]; cached: boolean }> {
+  const cachedEntries = parseRegistryEntries(await env.CLANKA_STATE.get(REGISTRY_CACHE_KEY));
+  if (cachedEntries !== null) {
+    return { entries: cachedEntries, cached: true };
+  }
+
+  try {
+    const headers: Record<string, string> = {
+      "User-Agent": "clanka-api/1.0",
+      "Accept": "application/vnd.github.v3+json",
+    };
+    if (env.GITHUB_TOKEN) headers["Authorization"] = `Bearer ${env.GITHUB_TOKEN}`;
+
+    const res = await fetch(REGISTRY_URL, { headers });
+    if (!res.ok) return { entries: [], cached: false };
+    const meta = await res.json() as { content?: string };
+    if (typeof meta.content !== "string" || meta.content.length === 0) {
+      return { entries: [], cached: false };
+    }
+
+    const decoded = decodeBase64(meta.content);
+    const entries = extractRegistryEntries(JSON.parse(decoded) as unknown);
+    await env.CLANKA_STATE.put(REGISTRY_CACHE_KEY, JSON.stringify(entries), {
+      expirationTtl: TOOLS_REGISTRY_TTL_SEC,
+    });
+    return { entries, cached: false };
+  } catch {
+    return { entries: [], cached: false };
   }
 }
 
@@ -995,16 +1059,6 @@ async function loadFleetHealthFromGithub(env: Env): Promise<FleetHealthPayload> 
     expirationTtl: FLEET_HEALTH_TTL_SEC,
   });
   return payload;
-}
-
-function registryEntriesToTools(entries: RegistryEntry[]): Tool[] {
-  return entries.map((e) => ({
-    name: e.repo.replace("clankamode/", ""),
-    description: e.description ?? `${e.tier} tool — ${e.criticality} criticality`,
-    status: "active" as ToolStatus,
-    tier: e.tier,
-    criticality: e.criticality,
-  }));
 }
 
 function registryEntriesToProjects(entries: RegistryEntry[]): Project[] {
@@ -1628,16 +1682,14 @@ export default {
         });
       }
 
-      const entries = await loadRegistryEntries(env);
-      const tools = entries.length > 0
-        ? registryEntriesToTools(entries)
-        : [];
+      const { entries, cached } = await loadToolsRegistryEntries(env);
 
       return new Response(
         JSON.stringify({
-          tools,
-          total: tools.length,
-          source: "registry",
+          tools: entries,
+          count: entries.length,
+          cached,
+          timestamp: new Date().toISOString(),
         }),
         { headers: corsHeaders },
       );
@@ -1739,8 +1791,20 @@ export default {
         });
       }
 
+      const token = typeof env.GITHUB_TOKEN === "string" ? env.GITHUB_TOKEN.trim() : "";
+      if (!token) {
+        return new Response(JSON.stringify({
+          commits: [],
+          error: "no token",
+          timestamp: new Date().toISOString(),
+        }), { headers: corsHeaders });
+      }
+
       const commits = await loadChangelog(env);
-      return new Response(JSON.stringify({ commits }), { headers: corsHeaders });
+      return new Response(JSON.stringify({
+        commits,
+        timestamp: new Date().toISOString(),
+      }), { headers: corsHeaders });
     }
 
     if (url.pathname === "/posts/count") {
