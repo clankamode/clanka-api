@@ -1391,10 +1391,19 @@ export default {
         });
       }
 
-      const historyRaw = await env.CLANKA_STATE.get("history") || "[]";
-      const history = normalizeHistory(safeParseJSON<unknown[]>(historyRaw, []));
+      const rawLimit = Number(url.searchParams.get("limit"));
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0
+        ? Math.min(HISTORY_LIMIT, Math.floor(rawLimit))
+        : HISTORY_LIMIT;
 
-      return new Response(JSON.stringify({ history: history.slice(0, HISTORY_LIMIT) }), {
+      const historyRaw = await env.CLANKA_STATE.get("history");
+      const historySource = safeParseJSON<unknown[]>(historyRaw, []);
+      const history = (Array.isArray(historySource) ? historySource : [])
+        .map((entry, index) => toHistoryEntry(entry, Date.now() - index))
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, limit);
+
+      return new Response(JSON.stringify({ history, count: history.length }), {
         headers: corsHeaders,
       });
     }

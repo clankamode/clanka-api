@@ -610,6 +610,155 @@ describe("GET /fleet/summary", () => {
     expect(body.byCriticality.critical).toEqual(["clankamode/alpha", "clankamode/beta"]);
   });
 
+  it("falls back to an empty repos list when registry cache JSON is malformed", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+
+    const res = await worker.fetch(
+      req("/fleet/summary"),
+      createEnv({ "registry:v1": "{invalid-json" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      generatedAt: expect.any(String),
+      totalRepos: 0,
+      repos: [],
+      source: "registry",
+    }));
+    expect(body.tiers).toEqual({
+      ops: [],
+      infra: [],
+      core: [],
+      quality: [],
+      policy: [],
+      template: [],
+    });
+    expect(body.byCriticality).toEqual({
+      critical: [],
+      high: [],
+      medium: [],
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a valid empty shape when registry cache is an empty array", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+
+    const res = await worker.fetch(
+      req("/fleet/summary"),
+      createEnv({ "registry:v1": JSON.stringify([]) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.totalRepos).toBe(0);
+    expect(body.repos).toEqual([]);
+    expect(body.tiers).toEqual({
+      ops: [],
+      infra: [],
+      core: [],
+      quality: [],
+      policy: [],
+      template: [],
+    });
+    expect(body.byCriticality).toEqual({
+      critical: [],
+      high: [],
+      medium: [],
+    });
+    expect(body.source).toBe("registry");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns source=registry and ISO generatedAt timestamp", async () => {
+    const res = await worker.fetch(req("/fleet/summary"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.source).toBe("registry");
+    expect(Number.isNaN(Date.parse(body.generatedAt))).toBe(false);
+  });
+
+  it("always includes all tier and criticality buckets", async () => {
+    const res = await worker.fetch(
+      req("/fleet/summary"),
+      createEnv({
+        "registry:v1": JSON.stringify([
+          { repo: "clankamode/only-core", criticality: "critical", tier: "core", description: "only" },
+        ]),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.tiers).toEqual({
+      ops: [],
+      infra: [],
+      core: ["clankamode/only-core"],
+      quality: [],
+      policy: [],
+      template: [],
+    });
+    expect(body.byCriticality).toEqual({
+      critical: ["clankamode/only-core"],
+      high: [],
+      medium: [],
+    });
+  });
+
+  it("filters malformed entries and deduplicates by repo", async () => {
+    const res = await worker.fetch(
+      req("/fleet/summary"),
+      createEnv({
+        "registry:v1": JSON.stringify([
+          { repo: "clankamode/good", criticality: "high", tier: "ops", description: "ok" },
+          { repo: "clankamode/good", criticality: "high", tier: "ops", description: "dup" },
+          { repo: "clankamode/bad-criticality", criticality: "low", tier: "ops", description: "bad" },
+          { repo: "", criticality: "high", tier: "ops", description: "bad" },
+        ]),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.totalRepos).toBe(1);
+    expect(body.repos).toEqual([
+      {
+        repo: "clankamode/good",
+        criticality: "high",
+        tier: "ops",
+      },
+    ]);
+  });
+
+  it("supports registry payloads wrapped in an entries array", async () => {
+    const res = await worker.fetch(
+      req("/fleet/summary"),
+      createEnv({
+        "registry:v1": JSON.stringify({
+          entries: [
+            { repo: "clankamode/entries-only", criticality: "medium", tier: "infra", description: "wrapped" },
+          ],
+        }),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.totalRepos).toBe(1);
+    expect(body.repos[0]).toEqual({
+      repo: "clankamode/entries-only",
+      criticality: "medium",
+      tier: "infra",
+    });
+  });
+
+  it("returns CORS headers", async () => {
+    const res = await worker.fetch(req("/fleet/summary"), createEnv());
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  });
+
   it("rejects non-GET with 405", async () => {
     const res = await worker.fetch(req("/fleet/summary", "POST"), createEnv());
     expect(res.status).toBe(405);
@@ -895,9 +1044,9 @@ describe("GET /fleet/health", () => {
 });
 
 describe("GET /history", () => {
-  it("returns capped history (max 20 entries) preserving order", async () => {
+  it("uses the default limit and returns at most 20 entries", async () => {
     const history = Array.from({ length: 30 }, (_, index) => ({
-      timestamp: 2_000_000 - index,
+      timestamp: 2_000_000 + index,
       desc: `event-${index}`,
       type: "SYNC",
       hash: `h${index}`,
@@ -911,8 +1060,183 @@ describe("GET /history", () => {
 
     expect(res.status).toBe(200);
     expect(body.history).toHaveLength(20);
-    expect(body.history[0]).toEqual(expect.objectContaining({ desc: "event-0" }));
-    expect(body.history[19]).toEqual(expect.objectContaining({ desc: "event-19" }));
+    expect(body.count).toBe(20);
+    expect(body.history[0]).toEqual(expect.objectContaining({ desc: "event-29" }));
+    expect(body.history[19]).toEqual(expect.objectContaining({ desc: "event-10" }));
+  });
+
+  it("applies explicit ?limit=5 and clamps output to 5 entries", async () => {
+    const history = Array.from({ length: 12 }, (_, index) => ({
+      timestamp: 1_000_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history?limit=5"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(5);
+    expect(body.count).toBe(5);
+    expect(body.history[0]).toEqual(expect.objectContaining({ desc: "event-11" }));
+    expect(body.history[4]).toEqual(expect.objectContaining({ desc: "event-7" }));
+  });
+
+  it("keeps count in sync with returned history length", async () => {
+    const history = Array.from({ length: 8 }, (_, index) => ({
+      timestamp: 900_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history?limit=3"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(3);
+    expect(body.count).toBe(body.history.length);
+  });
+
+  it("clamps ?limit above max to 20", async () => {
+    const history = Array.from({ length: 30 }, (_, index) => ({
+      timestamp: 1_000_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history?limit=100"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(20);
+    expect(body.count).toBe(20);
+  });
+
+  it("uses default limit when ?limit is not a number", async () => {
+    const history = Array.from({ length: 25 }, (_, index) => ({
+      timestamp: 1_000_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history?limit=abc"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(20);
+    expect(body.count).toBe(20);
+  });
+
+  it("uses default limit when ?limit is zero", async () => {
+    const history = Array.from({ length: 22 }, (_, index) => ({
+      timestamp: 1_000_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history?limit=0"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(20);
+    expect(body.count).toBe(20);
+  });
+
+  it("uses default limit when ?limit is negative", async () => {
+    const history = Array.from({ length: 22 }, (_, index) => ({
+      timestamp: 1_000_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history?limit=-5"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(20);
+    expect(body.count).toBe(20);
+  });
+
+  it("floors decimal limit values", async () => {
+    const history = Array.from({ length: 9 }, (_, index) => ({
+      timestamp: 1_000_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history?limit=3.9"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(3);
+    expect(body.count).toBe(3);
+  });
+
+  it("returns reverse-chronological order (newest first)", async () => {
+    const res = await worker.fetch(
+      req("/history"),
+      createEnv({
+        history: JSON.stringify([
+          { timestamp: 1000, desc: "oldest", type: "SYNC", hash: "h1" },
+          { timestamp: 3000, desc: "newest", type: "SYNC", hash: "h3" },
+          { timestamp: 2000, desc: "middle", type: "SYNC", hash: "h2" },
+        ]),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history.map((entry: any) => entry.desc)).toEqual(["newest", "middle", "oldest"]);
+  });
+
+  it("returns empty history when cached history JSON is invalid", async () => {
+    const res = await worker.fetch(
+      req("/history"),
+      createEnv({ history: "{invalid-json" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ history: [], count: 0 });
+  });
+
+  it("returns empty history when cached history is not an array", async () => {
+    const res = await worker.fetch(
+      req("/history"),
+      createEnv({ history: JSON.stringify({ desc: "not-an-array" }) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ history: [], count: 0 });
   });
 
   it("normalizes malformed history entries to safe defaults", async () => {
@@ -944,13 +1268,29 @@ describe("GET /history", () => {
       hash: "abc12345",
       timestamp: 12345,
     }));
+    expect(body.count).toBe(3);
   });
 
-  it("returns empty history when no history exists", async () => {
+  it("returns { history: [], count: 0 } for explicitly empty history", async () => {
+    const res = await worker.fetch(
+      req("/history"),
+      createEnv({ history: JSON.stringify([]) }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ history: [], count: 0 });
+  });
+
+  it("returns empty history gracefully on KV miss", async () => {
     const res = await worker.fetch(req("/history"), createEnv());
     const body = await json(res);
     expect(res.status).toBe(200);
-    expect(body).toEqual({ history: [] });
+    expect(body).toEqual({ history: [], count: 0 });
+  });
+
+  it("returns CORS headers", async () => {
+    const res = await worker.fetch(req("/history"), createEnv());
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
   });
 
   it("rejects non-GET with 405", async () => {
