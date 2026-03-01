@@ -23,6 +23,13 @@ type GhEvent = {
 
 const GITHUB_EVENTS_CACHE_KEY = "github:events:v1";
 const GITHUB_EVENTS_TTL_SEC = 900;
+const MESSAGE_MAX_LEN = 100;
+
+function truncateMessage(message: string, maxLen = MESSAGE_MAX_LEN): string {
+  if (message.length <= maxLen) return message;
+  if (maxLen <= 3) return ".".repeat(maxLen);
+  return `${message.slice(0, maxLen - 3)}...`;
+}
 
 export async function loadGithubEvents(kv: KVNamespace): Promise<GithubEvent[]> {
   const cached = await kv.get(GITHUB_EVENTS_CACHE_KEY);
@@ -48,18 +55,18 @@ export async function loadGithubEvents(kv: KVNamespace): Promise<GithubEvent[]> 
     if (e.type === "PushEvent") {
       type = "PUSH";
       const msg = e.payload.commits?.[0]?.message ?? "push";
-      message = msg.split("\n")[0].slice(0, 80);
+      message = truncateMessage(msg.split("\n")[0]);
     } else if (e.type === "PullRequestEvent") {
       type = "PR";
       const pr = e.payload.pull_request;
-      message = `${e.payload.action} PR #${pr?.number}: ${pr?.title?.slice(0, 60) ?? ""}`;
+      message = truncateMessage(`${e.payload.action} PR #${pr?.number}: ${pr?.title ?? ""}`);
     } else if (e.type === "IssuesEvent") {
       type = "ISSUE";
       const issue = e.payload.issue;
-      message = `${e.payload.action} issue #${issue?.number}: ${issue?.title?.slice(0, 60) ?? ""}`;
+      message = truncateMessage(`${e.payload.action} issue #${issue?.number}: ${issue?.title ?? ""}`);
     } else if (e.type === "CreateEvent") {
       type = "CREATE";
-      message = `created ${e.payload.ref_type} ${e.payload.ref ?? ""}`.trim();
+      message = truncateMessage(`created ${e.payload.ref_type} ${e.payload.ref ?? ""}`.trim());
     }
 
     events.push({ type, repo, message, timestamp: e.created_at });

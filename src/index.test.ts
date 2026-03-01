@@ -303,6 +303,57 @@ describe("GET /tools", () => {
   });
 });
 
+describe("Malformed cache fallbacks", () => {
+  it("returns an empty tools payload when registry:v1 cache JSON is malformed", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+
+    const res = await worker.fetch(
+      req("/tools"),
+      createEnv({ "registry:v1": "{invalid-json" }, { GITHUB_TOKEN: "gh-token" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      tools: [],
+      count: 0,
+    }));
+  });
+
+  it("returns safe defaults when github:stats cache JSON is malformed", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+
+    const res = await worker.fetch(
+      req("/github/stats"),
+      createEnv({ "github:stats:v1": "{invalid-json" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      repoCount: 0,
+      totalStars: 0,
+      lastPushedAt: null,
+      lastPushedRepo: null,
+      cachedAt: expect.any(String),
+    }));
+    expect(Number.isNaN(Date.parse(body.cachedAt))).toBe(false);
+  });
+
+  it("returns { events: [] } when github:events:v1 cache JSON is malformed", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+
+    const res = await worker.fetch(
+      req("/github/events"),
+      createEnv({ "github:events:v1": "{invalid-json" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ events: [] });
+  });
+});
+
 // /tasks
 describe("GET /tasks", () => {
   it("returns 200 and parsed open tasks grouped by repo", async () => {

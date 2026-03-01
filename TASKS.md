@@ -35,8 +35,8 @@
 
 ## 🟢 Low Priority / Nice to Have
 - [x] Add a `README` endpoint matrix table for public/admin routes with auth, method, status code classes, and operational notes. (completed 2026-03-01)
-- [ ] Add `src/index.test.ts` coverage for malformed/empty GitHub registry cache values in `src/index.ts` fallback paths (`registry:v1`, `GITHUB_STATS_CACHE_KEY`, `github:events:v1`) to avoid 500s and return safe defaults.
-- [ ] Add utility parsing tests for `src/github-events.ts` to lock `repo` normalization and event message truncation (Push/PR/Issue/Create).
+- [x] Add `src/index.test.ts` coverage for malformed/empty GitHub registry cache values in `src/index.ts` fallback paths (`registry:v1`, `GITHUB_STATS_CACHE_KEY`, `github:events:v1`) to avoid 500s and return safe defaults. (completed 2026-03-01)
+- [x] Add utility parsing tests for `src/github-events.ts` to lock `repo` normalization and event message truncation (Push/PR/Issue/Create). (completed 2026-03-01)
 
 ## 🧠 Notes
 - Stack: Cloudflare Workers + KV (`CLANKA_STATE`), TypeScript, Wrangler
