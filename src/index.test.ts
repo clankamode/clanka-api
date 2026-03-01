@@ -229,18 +229,14 @@ describe("GET /tasks", () => {
     const body = await json(res) as any[];
     expect(Array.isArray(body)).toBe(true);
     expect(body).toHaveLength(2);
-
-    expect(body[0]).toEqual({
-      repo: "clankamode/clanka-api",
-      tasks: [
-        { priority: "red", text: "Fix auth edge case", done: false },
-        { priority: "green", text: "Polish docs", done: false },
-      ],
-    });
-    expect(body[1]).toEqual({
-      repo: "clankamode/ci-triage",
-      tasks: [{ priority: "yellow", text: "Harden parser", done: false }],
-    });
+    const byRepo = Object.fromEntries(body.map((entry) => [entry.repo, entry.tasks]));
+    expect(byRepo["clankamode/clanka-api"]).toEqual([
+      { priority: "red", text: "Fix auth edge case", done: false },
+      { priority: "green", text: "Polish docs", done: false },
+    ]);
+    expect(byRepo["clankamode/ci-triage"]).toEqual([
+      { priority: "yellow", text: "Harden parser", done: false },
+    ]);
   });
 
   it("returns empty task list for repos without TASKS.md", async () => {
@@ -248,15 +244,201 @@ describe("GET /tasks", () => {
     const res = await worker.fetch(req("/tasks"), createEnv());
     expect(res.status).toBe(200);
     const body = await json(res) as any[];
-    expect(body).toEqual([
-      { repo: "clankamode/clanka-api", tasks: [] },
-      { repo: "clankamode/ci-triage", tasks: [] },
-    ]);
+    const byRepo = Object.fromEntries(body.map((entry) => [entry.repo, entry.tasks]));
+    expect(byRepo["clankamode/clanka-api"]).toEqual([]);
+    expect(byRepo["clankamode/ci-triage"]).toEqual([]);
   });
 
   it("rejects non-GET with 405", async () => {
     const res = await worker.fetch(req("/tasks", "POST"), createEnv());
     expect(res.status).toBe(405);
+  });
+});
+
+describe("Registry alignment and fallback", () => {
+  it("hydrates /tools from live registry.json when primary cache is invalid", async () => {
+    const liveRegistry = {
+      tools: [
+        { repo: "clankamode/zeta-tool", criticality: "medium", tier: "ops", description: "Zeta tool" },
+        { repo: "clankamode/alpha-tool", criticality: "critical", tier: "core", description: "Alpha tool" },
+      ],
+    };
+    const content = Buffer.from(JSON.stringify(liveRegistry), "utf8").toString("base64");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ content }), { status: 200 }));
+
+    const kvStore: Record<string, string> = { "registry:v1": "{invalid-json" };
+    const env = {
+      CLANKA_STATE: createMockKV(kvStore),
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    const res = await worker.fetch(req("/tools"), env as any);
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.tools.map((tool: any) => tool.name)).toEqual(["alpha-tool", "zeta-tool"]);
+    expect(kvStore["registry:v1"]).toBeTruthy();
+    expect(kvStore["registry:v1:stale"]).toBeTruthy();
+  });
+
+  it("falls back to stale KV registry cache when GitHub API fails", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+
+    const staleRegistry = [
+      { repo: "clankamode/stale-tool", criticality: "high", tier: "infra", description: "Stale tool" },
+    ];
+    const res = await worker.fetch(
+      req("/tools"),
+      createEnv({
+        "registry:v1": "{invalid-json",
+        "registry:v1:stale": JSON.stringify(staleRegistry),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.total).toBe(1);
+    expect(body.tools[0]).toEqual(expect.objectContaining({
+      name: "stale-tool",
+      tier: "infra",
+      criticality: "high",
+      description: "Stale tool",
+    }));
+  });
+
+  it("filters malformed registry entries before serving /tools", async () => {
+    const res = await worker.fetch(
+      req("/tools"),
+      createEnv({
+        "registry:v1": JSON.stringify([
+          { repo: "clankamode/good-tool", criticality: "critical", tier: "core", description: "Good" },
+          { repo: "clankamode/bad-criticality", criticality: "low", tier: "core", description: "Bad" },
+          { repo: "clankamode/bad-tier", criticality: "high", tier: "misc", description: "Bad" },
+          { repo: "", criticality: "high", tier: "ops", description: "Bad" },
+        ]),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.total).toBe(1);
+    expect(body.tools[0].name).toBe("good-tool");
+  });
+});
+
+describe("GET /fleet/summary", () => {
+  it("returns grouped metadata with deterministic ordering", async () => {
+    const res = await worker.fetch(
+      req("/fleet/summary"),
+      createEnv({
+        "registry:v1": JSON.stringify([
+          { repo: "clankamode/zeta", criticality: "medium", tier: "ops", description: "z" },
+          { repo: "clankamode/alpha", criticality: "critical", tier: "core", description: "a" },
+          { repo: "clankamode/beta", criticality: "critical", tier: "core", description: "b" },
+        ]),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.totalRepos).toBe(3);
+    expect(body.repos.map((repo: any) => repo.repo)).toEqual([
+      "clankamode/alpha",
+      "clankamode/beta",
+      "clankamode/zeta",
+    ]);
+    expect(body.tiers.core).toEqual(["clankamode/alpha", "clankamode/beta"]);
+    expect(body.byCriticality.critical).toEqual(["clankamode/alpha", "clankamode/beta"]);
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/fleet/summary", "POST"), createEnv());
+    expect(res.status).toBe(405);
+  });
+});
+
+describe("GET /now and GET /pulse contracts", () => {
+  it("returns consistent /now payload with status, signal, and last_seen", async () => {
+    const now = 1_750_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+
+    const res = await worker.fetch(
+      req("/now"),
+      createEnv({
+        started: String(now - 60_000),
+        last_seen: String(now - 5_000),
+        presence: JSON.stringify({
+          state: "active",
+          message: "monitoring workspace",
+          timestamp: now - 5_000,
+        }),
+        team: JSON.stringify({
+          clanka: { status: "active" },
+          helper: { status: "idle" },
+        }),
+        history: JSON.stringify([
+          { timestamp: now - 4_000, type: "SYNC", desc: "sync done", hash: "abc12345" },
+        ]),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      status: "active",
+      signal: "⚡",
+      last_seen: new Date(now - 5_000).toISOString(),
+      timestamp: now - 5_000,
+      agents_active: 1,
+    }));
+    expect(Array.isArray(body.history)).toBe(true);
+    expect(body.team).toEqual(expect.objectContaining({ clanka: { status: "active" } }));
+  });
+
+  it("returns offline status in /now when heartbeat is stale", async () => {
+    const now = 1_750_000_000_000;
+    const thresholdMs = 10 * 60 * 1000;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+
+    const res = await worker.fetch(
+      req("/now"),
+      createEnv({
+        last_seen: String(now - thresholdMs - 1),
+        presence: JSON.stringify({
+          state: "active",
+          timestamp: now - thresholdMs - 1,
+        }),
+      }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("offline");
+    expect(body.signal).toBe("⚡");
+  });
+
+  it("rejects non-GET /now with 405", async () => {
+    const res = await worker.fetch(req("/now", "POST"), createEnv());
+    expect(res.status).toBe(405);
+  });
+
+  it("returns deterministic /pulse payload shape", async () => {
+    const res = await worker.fetch(
+      req("/pulse"),
+      createEnv({
+        presence: JSON.stringify({ state: "active" }),
+        team: JSON.stringify({ clanka: { status: "active" }, helper: { status: "idle" } }),
+        history: JSON.stringify([{ type: "SYNC", desc: "deployed", timestamp: 12345, hash: "aaa" }]),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      ts: expect.any(String),
+      status: "active",
+      agents_active: 1,
+      last_event_desc: "deployed",
+    }));
   });
 });
 

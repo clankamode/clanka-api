@@ -26,7 +26,9 @@ type ChangelogEntry = {
 const HISTORY_LIMIT = 20;
 const REGISTRY_URL = "https://api.github.com/repos/clankamode/assistant-tool-registry/contents/registry.json";
 const REGISTRY_CACHE_KEY = "registry:v1";
+const REGISTRY_STALE_CACHE_KEY = `${REGISTRY_CACHE_KEY}:stale`;
 const REGISTRY_TTL_SEC = 3600; // 1 hour
+const REGISTRY_STALE_TTL_SEC = 7 * 24 * 60 * 60; // 7 days
 
 const REQUEST_LOG_KEY = "request_log";
 const REQUEST_LOG_TTL_SEC = 24 * 60 * 60; // 24h
@@ -291,7 +293,7 @@ type RegistryEntry = {
   repo: string;
   criticality: FleetCriticality;
   tier: FleetTier;
-  description?: string;
+  description: string;
 };
 
 type TaskPriority = "red" | "yellow" | "green";
@@ -470,17 +472,85 @@ async function loadChangelog(env: Env): Promise<ChangelogEntry[]> {
   return payload;
 }
 
-async function loadRegistryEntries(env: Env): Promise<RegistryEntry[]> {
-  // Try KV cache first
-  const cached = await env.CLANKA_STATE.get(REGISTRY_CACHE_KEY);
-  if (cached) {
-    try {
-      const parsed = JSON.parse(cached) as { tools?: RegistryEntry[] } | RegistryEntry[];
-      return Array.isArray(parsed) ? parsed : (parsed.tools ?? []);
-    } catch { /* fall through to fetch */ }
+function isFleetTier(value: unknown): value is FleetTier {
+  return value === "ops"
+    || value === "infra"
+    || value === "core"
+    || value === "quality"
+    || value === "policy"
+    || value === "template";
+}
+
+function isFleetCriticality(value: unknown): value is FleetCriticality {
+  return value === "critical" || value === "high" || value === "medium";
+}
+
+function normalizeRegistryEntry(entry: unknown): RegistryEntry | null {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+
+  const item = entry as {
+    repo?: unknown;
+    criticality?: unknown;
+    tier?: unknown;
+    description?: unknown;
+  };
+  const repo = typeof item.repo === "string" ? item.repo.trim() : "";
+  if (!repo || !repo.includes("/")) return null;
+  if (!isFleetCriticality(item.criticality) || !isFleetTier(item.tier)) return null;
+
+  const description = typeof item.description === "string" && item.description.trim().length > 0
+    ? item.description.trim()
+    : `${item.tier} tool - ${item.criticality} criticality`;
+
+  return {
+    repo,
+    criticality: item.criticality,
+    tier: item.tier,
+    description,
+  };
+}
+
+function extractRegistryEntries(payload: unknown): RegistryEntry[] {
+  let source: unknown[] = [];
+  if (Array.isArray(payload)) {
+    source = payload;
+  } else if (payload && typeof payload === "object") {
+    const shape = payload as { tools?: unknown; registry?: unknown; entries?: unknown };
+    if (Array.isArray(shape.tools)) source = shape.tools;
+    else if (Array.isArray(shape.registry)) source = shape.registry;
+    else if (Array.isArray(shape.entries)) source = shape.entries;
   }
 
-  // Fetch from GitHub API (handles private repos via token)
+  const seen = new Set<string>();
+  const normalized: RegistryEntry[] = [];
+  for (const item of source) {
+    const entry = normalizeRegistryEntry(item);
+    if (!entry) continue;
+    const dedupeKey = entry.repo.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    normalized.push(entry);
+  }
+
+  normalized.sort((a, b) => a.repo.localeCompare(b.repo));
+  return normalized;
+}
+
+function parseRegistryEntries(raw: string | null): RegistryEntry[] | null {
+  if (raw === null) return null;
+  try {
+    return extractRegistryEntries(JSON.parse(raw) as unknown);
+  } catch {
+    return null;
+  }
+}
+
+async function loadRegistryEntries(env: Env): Promise<RegistryEntry[]> {
+  const cachedEntries = parseRegistryEntries(await env.CLANKA_STATE.get(REGISTRY_CACHE_KEY));
+  if (cachedEntries !== null) return cachedEntries;
+
+  const staleEntries = parseRegistryEntries(await env.CLANKA_STATE.get(REGISTRY_STALE_CACHE_KEY));
+
   try {
     const headers: Record<string, string> = {
       "User-Agent": "clanka-api/1.0",
@@ -489,17 +559,22 @@ async function loadRegistryEntries(env: Env): Promise<RegistryEntry[]> {
     if (env.GITHUB_TOKEN) headers["Authorization"] = `Bearer ${env.GITHUB_TOKEN}`;
 
     const res = await fetch(REGISTRY_URL, { headers });
-    if (!res.ok) return [];
+    if (!res.ok) return staleEntries ?? [];
     const meta = await res.json() as { content?: string };
-    if (!meta.content) return [];
+    if (typeof meta.content !== "string" || meta.content.length === 0) return staleEntries ?? [];
     const json = decodeBase64(meta.content);
-    const data = JSON.parse(json) as { tools?: RegistryEntry[] } | RegistryEntry[];
-    const entries = Array.isArray(data) ? data : (data.tools ?? []);
-    // Cache it
-    await env.CLANKA_STATE.put(REGISTRY_CACHE_KEY, JSON.stringify(entries), { expirationTtl: REGISTRY_TTL_SEC });
+    const entries = extractRegistryEntries(JSON.parse(json) as unknown);
+    await Promise.all([
+      env.CLANKA_STATE.put(REGISTRY_CACHE_KEY, JSON.stringify(entries), {
+        expirationTtl: REGISTRY_TTL_SEC,
+      }),
+      env.CLANKA_STATE.put(REGISTRY_STALE_CACHE_KEY, JSON.stringify(entries), {
+        expirationTtl: REGISTRY_STALE_TTL_SEC,
+      }),
+    ]);
     return entries;
   } catch {
-    return [];
+    return staleEntries ?? [];
   }
 }
 
@@ -930,11 +1005,13 @@ export default {
       }
 
       const registryEntries = await loadRegistryEntries(env);
-      const fleetItems: FleetRepo[] = registryEntries.map((e) => ({
-        repo: e.repo,
-        criticality: e.criticality,
-        tier: e.tier,
-      }));
+      const fleetItems: FleetRepo[] = registryEntries
+        .map((e) => ({
+          repo: e.repo,
+          criticality: e.criticality,
+          tier: e.tier,
+        }))
+        .sort((a, b) => a.repo.localeCompare(b.repo));
 
       const tiers: Record<FleetTier, string[]> = {
         ops: [],
@@ -953,6 +1030,12 @@ export default {
       for (const item of fleetItems) {
         tiers[item.tier].push(item.repo);
         byCriticality[item.criticality].push(item.repo);
+      }
+      for (const tier of Object.keys(tiers) as FleetTier[]) {
+        tiers[tier].sort((a, b) => a.localeCompare(b));
+      }
+      for (const criticality of Object.keys(byCriticality) as FleetCriticality[]) {
+        byCriticality[criticality].sort((a, b) => a.localeCompare(b));
       }
 
       return new Response(
@@ -1132,11 +1215,19 @@ export default {
     }
 
     if (url.pathname === "/now") {
-      const [presenceRaw, historyRaw, teamRaw, startedRaw] = await Promise.all([
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const [presenceRaw, historyRaw, teamRaw, startedRaw, lastSeenRaw] = await Promise.all([
         env.CLANKA_STATE.get("presence"),
         env.CLANKA_STATE.get("history"),
         env.CLANKA_STATE.get("team"),
         env.CLANKA_STATE.get("started"),
+        env.CLANKA_STATE.get(LAST_SEEN_KEY),
       ]);
       const now = Date.now();
       const presence = safeParseJSON<{ state?: string; message?: string; timestamp?: number } | null>(presenceRaw, null);
@@ -1148,18 +1239,26 @@ export default {
         await env.CLANKA_STATE.put("started", String(started));
       }
       const agentsActive = countActiveAgents(team);
-      const lastSeenMs = typeof presence?.timestamp === "number" ? presence.timestamp : now;
+      const lastSeenFromPresence = typeof presence?.timestamp === "number" ? presence.timestamp : NaN;
+      const lastSeenFromHeartbeat = typeof lastSeenRaw === "string" ? Number(lastSeenRaw) : NaN;
+      const lastSeenMs = Number.isFinite(lastSeenFromHeartbeat)
+        ? lastSeenFromHeartbeat
+        : Number.isFinite(lastSeenFromPresence)
+          ? lastSeenFromPresence
+          : now;
+      const isOffline = now - lastSeenMs > STATUS_OFFLINE_THRESHOLD_MS;
 
       return new Response(JSON.stringify({
         current: presence?.message || "monitoring workspace and building public signals",
-        status: presence?.state || "active",
+        status: isOffline ? "offline" : (presence?.state || "active"),
+        signal: "⚡",
         stack: ["Cloudflare Workers", "TypeScript", "Lit"],
         timestamp: lastSeenMs,
         uptime: Math.max(0, now - started),
         agents_active: agentsActive,
         last_seen: new Date(lastSeenMs).toISOString(),
         history,
-        team
+        team,
       }), { headers: corsHeaders });
     }
 
