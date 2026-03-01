@@ -12,7 +12,17 @@ const VALID_SET_PRESENCE_PAYLOAD = {
   team: { clanka: { status: "active", task: "ship tests" } },
   activity: { type: "SYNC", desc: "presence updated" },
 };
-const STATUS_ENDPOINTS = ["/", "/fleet/summary", "/fleet/health", "/history", "/now", "/status", "/metrics"];
+const STATUS_ENDPOINTS = [
+  "/",
+  "/fleet/summary",
+  "/fleet/health",
+  "/fleet/score",
+  "/history",
+  "/now",
+  "/status",
+  "/tools/search",
+  "/metrics",
+];
 
 function createMockKV(store: Record<string, string> = {}): any {
   return {
@@ -56,6 +66,7 @@ async function json(res: Response) {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 // /projects
@@ -2050,11 +2061,27 @@ describe("POST /admin/refresh", () => {
 });
 
 describe("Rate limiting", () => {
-  it("returns 429 after 60 public GET requests in a minute", async () => {
+  it("skips rate limiting automatically in test environment", async () => {
+    vi.stubEnv("VITEST", "true");
+    vi.stubEnv("NODE_ENV", "test");
+
     const env = createEnv({ "registry:v1": JSON.stringify(MOCK_REGISTRY) });
     const headers = { "X-Forwarded-For": "203.0.113.1" };
 
-    for (let i = 0; i < 60; i += 1) {
+    for (let i = 0; i < 20; i += 1) {
+      const res = await worker.fetch(req("/status", "GET", undefined, headers), env);
+      expect(res.status).toBe(200);
+    }
+  });
+
+  it("returns 429 after 10 public GET requests in a minute outside test env", async () => {
+    vi.stubEnv("VITEST", "");
+    vi.stubEnv("NODE_ENV", "production");
+
+    const env = createEnv({ "registry:v1": JSON.stringify(MOCK_REGISTRY) });
+    const headers = { "X-Forwarded-For": "203.0.113.1" };
+
+    for (let i = 0; i < 10; i += 1) {
       const res = await worker.fetch(req("/status", "GET", undefined, headers), env);
       expect(res.status).toBe(200);
     }
@@ -2065,12 +2092,15 @@ describe("Rate limiting", () => {
   });
 
   it("allows requests after 60s window passes", async () => {
+    vi.stubEnv("VITEST", "");
+    vi.stubEnv("NODE_ENV", "production");
+
     const now = Date.now();
     const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
     const env = createEnv({ "registry:v1": JSON.stringify(MOCK_REGISTRY) });
     const headers = { "X-Forwarded-For": "198.51.100.42" };
 
-    for (let i = 0; i < 60; i += 1) {
+    for (let i = 0; i < 10; i += 1) {
       const res = await worker.fetch(req("/status", "GET", undefined, headers), env);
       expect(res.status).toBe(200);
     }
@@ -2081,6 +2111,62 @@ describe("Rate limiting", () => {
     nowSpy.mockReturnValue(now + 60_000);
     const reset = await worker.fetch(req("/status", "GET", undefined, headers), env);
     expect(reset.status).toBe(200);
+  });
+
+  it("tracks limits independently per IP", async () => {
+    vi.stubEnv("VITEST", "");
+    vi.stubEnv("NODE_ENV", "production");
+
+    const env = createEnv({ "registry:v1": JSON.stringify(MOCK_REGISTRY) });
+    const ipA = { "X-Forwarded-For": "198.51.100.10" };
+    const ipB = { "X-Forwarded-For": "198.51.100.11" };
+
+    for (let i = 0; i < 10; i += 1) {
+      const res = await worker.fetch(req("/status", "GET", undefined, ipA), env);
+      expect(res.status).toBe(200);
+    }
+    const limited = await worker.fetch(req("/status", "GET", undefined, ipA), env);
+    expect(limited.status).toBe(429);
+
+    const freshIp = await worker.fetch(req("/status", "GET", undefined, ipB), env);
+    expect(freshIp.status).toBe(200);
+  });
+
+  it("does not rate limit /metrics because it is admin-scoped", async () => {
+    vi.stubEnv("VITEST", "");
+    vi.stubEnv("NODE_ENV", "production");
+
+    const env = createEnv({}, { ADMIN_TOKEN: "metrics-secret" });
+    for (let i = 0; i < 20; i += 1) {
+      const res = await worker.fetch(req("/metrics"), env);
+      expect(res.status).toBe(401);
+    }
+  });
+
+  it("does not rate limit non-GET requests", async () => {
+    vi.stubEnv("VITEST", "");
+    vi.stubEnv("NODE_ENV", "production");
+
+    const env = createEnv();
+    for (let i = 0; i < 20; i += 1) {
+      const res = await worker.fetch(req("/set-presence", "POST", {}), env);
+      expect(res.status).toBe(401);
+    }
+  });
+
+  it("applies limits to /tools/search public GET endpoint", async () => {
+    vi.stubEnv("VITEST", "");
+    vi.stubEnv("NODE_ENV", "production");
+
+    const env = createEnv({ "registry:v1": JSON.stringify(MOCK_REGISTRY) });
+    const headers = { "X-Forwarded-For": "203.0.113.99" };
+    for (let i = 0; i < 10; i += 1) {
+      const res = await worker.fetch(req("/tools/search?q=clanka", "GET", undefined, headers), env);
+      expect(res.status).toBe(200);
+    }
+
+    const limited = await worker.fetch(req("/tools/search?q=clanka", "GET", undefined, headers), env);
+    expect(limited.status).toBe(429);
   });
 });
 

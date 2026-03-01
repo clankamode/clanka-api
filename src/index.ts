@@ -84,10 +84,20 @@ const CACHE_KEYS_TO_INVALIDATE = [
 const RATE_LIMIT_KEY_PREFIX = "rate_limit:ip:";
 const RATE_LIMIT_WINDOW_SEC = 60;
 const RATE_LIMIT_WINDOW_MS = RATE_LIMIT_WINDOW_SEC * 1000;
-const RATE_LIMIT_MAX_REQUESTS = 60;
+const RATE_LIMIT_MAX_REQUESTS = 10;
 const METRICS_KEY = "metrics:v1";
 const API_VERSION = "1.0.0";
-const STATUS_ENDPOINTS = ["/", "/fleet/summary", "/fleet/health", "/history", "/now", "/status", "/metrics"];
+const STATUS_ENDPOINTS = [
+  "/",
+  "/fleet/summary",
+  "/fleet/health",
+  "/fleet/score",
+  "/history",
+  "/now",
+  "/status",
+  "/tools/search",
+  "/metrics",
+];
 const startTime = Date.now();
 
 const OPENAPI_SPEC = {
@@ -510,6 +520,13 @@ function getClientIp(request: Request): string {
 
 function isPublicGetEndpoint(pathname: string): boolean {
   return pathname !== "/set-presence" && pathname !== "/metrics" && !pathname.startsWith("/admin");
+}
+
+function isTestEnvironment(): boolean {
+  const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
+  const env = proc?.env;
+  if (!env) return false;
+  return env.VITEST === "true" || env.NODE_ENV === "test";
 }
 
 async function checkRateLimit(env: Env, request: Request): Promise<{ allowed: boolean; retryAfter: number }> {
@@ -1490,7 +1507,7 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    if (request.method === "GET" && isPublicGetEndpoint(url.pathname)) {
+    if (request.method === "GET" && isPublicGetEndpoint(url.pathname) && !isTestEnvironment()) {
       const rateLimit = await checkRateLimit(env, request);
       if (!rateLimit.allowed) {
         return new Response(JSON.stringify({ error: "Too Many Requests" }), {
@@ -1856,6 +1873,18 @@ export default {
       }
     }
 
+    if (url.pathname === "/fleet/score") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const payload = await loadFleetScorePayload(env);
+      return new Response(JSON.stringify(payload), { headers: corsHeaders });
+    }
+
     if (url.pathname === "/pulse") {
       if (request.method !== "GET") {
         return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
@@ -1974,6 +2003,33 @@ export default {
         JSON.stringify({ projects, source: "registry", cached: true }),
         { headers: corsHeaders },
       );
+    }
+
+    if (url.pathname === "/tools/search") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const query = url.searchParams.get("q")?.trim() || "";
+      if (!query) {
+        return new Response(JSON.stringify({ error: "Missing query parameter: q" }), {
+          status: 400,
+          headers: corsHeaders,
+        });
+      }
+
+      const { entries, cached } = await loadToolsRegistryEntries(env);
+      const tools = searchRegistryTools(entries, query);
+      return new Response(JSON.stringify({
+        query,
+        count: tools.length,
+        tools,
+        cached,
+        timestamp: new Date().toISOString(),
+      }), { headers: corsHeaders });
     }
 
     if (url.pathname === "/tools") {
