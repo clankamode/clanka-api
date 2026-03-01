@@ -140,39 +140,83 @@ describe("GET /tools", () => {
     expect(res.headers.get("Content-Type")).toContain("application/json");
   });
 
-  it("response shape has tools array, total, source", async () => {
+  it("response shape has tools array, count, cached, timestamp", async () => {
     const res = await worker.fetch(req("/tools"), createEnv());
     const body = await json(res);
     expect(body).toEqual(
       expect.objectContaining({
         tools: expect.any(Array),
-        total: expect.any(Number),
-        source: "registry",
+        count: expect.any(Number),
+        cached: expect.any(Boolean),
+        timestamp: expect.any(String),
       }),
     );
-    expect(body).toHaveProperty("tools");
-    expect(body).toHaveProperty("total");
-    expect(body).toHaveProperty("source", "registry");
-    expect(body.tools).toBeInstanceOf(Array);
-    expect(body.total).toBe(body.tools.length);
+    expect(Number.isNaN(Date.parse(body.timestamp))).toBe(false);
   });
 
-  it("each tool has name, description, status", async () => {
+  it("count matches tools length", async () => {
+    const res = await worker.fetch(req("/tools"), createEnv());
+    const body = await json(res);
+    expect(body.count).toBe(body.tools.length);
+  });
+
+  it("each tool has repo, description, tier, criticality", async () => {
     const res = await worker.fetch(req("/tools"), createEnv());
     const body = await json(res);
     for (const t of body.tools) {
-      expect(t).toHaveProperty("name");
+      expect(t).toHaveProperty("repo");
       expect(t).toHaveProperty("description");
-      expect(t).toHaveProperty("status");
+      expect(t).toHaveProperty("tier");
+      expect(t).toHaveProperty("criticality");
     }
   });
 
   it("returns tools from mock registry", async () => {
     const res = await worker.fetch(req("/tools"), createEnv());
     const body = await json(res);
-    const names = body.tools.map((t: any) => t.name);
-    expect(names).toContain("clanka-api");
-    expect(names).toContain("ci-triage");
+    const repos = body.tools.map((t: any) => t.repo);
+    expect(repos).toContain("clankamode/clanka-api");
+    expect(repos).toContain("clankamode/ci-triage");
+  });
+
+  it("sets cached=true when served from KV", async () => {
+    const res = await worker.fetch(req("/tools"), createEnv());
+    const body = await json(res);
+    expect(body.cached).toBe(true);
+  });
+
+  it("supports registry payloads stored under an entries array shape", async () => {
+    const res = await worker.fetch(
+      req("/tools"),
+      createEnv({
+        "registry:v1": JSON.stringify({
+          entries: [
+            { repo: "clankamode/entries-tool", criticality: "medium", tier: "ops", description: "Entries tool" },
+          ],
+        }),
+      }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body.cached).toBe(true);
+    expect(body.count).toBe(1);
+    expect(body.tools[0].repo).toBe("clankamode/entries-tool");
+  });
+
+  it("deduplicates registry entries by repo name", async () => {
+    const res = await worker.fetch(
+      req("/tools"),
+      createEnv({
+        "registry:v1": JSON.stringify([
+          { repo: "clankamode/dup-tool", criticality: "high", tier: "ops", description: "A" },
+          { repo: "clankamode/dup-tool", criticality: "high", tier: "ops", description: "B" },
+        ]),
+      }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body.count).toBe(1);
+    expect(body.tools[0].repo).toBe("clankamode/dup-tool");
   });
 
   it("returns CORS headers", async () => {
@@ -180,16 +224,77 @@ describe("GET /tools", () => {
     expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
   });
 
-  it("returns empty tools array when registry cache is empty", async () => {
+  it("returns cached=false on KV miss and fetches from GitHub", async () => {
+    const liveRegistry = {
+      tools: [
+        { repo: "clankamode/live-tool", criticality: "high", tier: "ops", description: "Live tool" },
+      ],
+    };
+    const content = Buffer.from(JSON.stringify(liveRegistry), "utf8").toString("base64");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ content }), { status: 200 }));
+
+    const env = {
+      CLANKA_STATE: createMockKV({}),
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    const res = await worker.fetch(req("/tools"), env as any);
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.cached).toBe(false);
+    expect(body.count).toBe(1);
+    expect(body.tools[0].repo).toBe("clankamode/live-tool");
+  });
+
+  it("writes fetched registry to KV with 5-minute TTL", async () => {
+    const putCalls: Array<{ key: string; opts?: any }> = [];
+    const kvStore: Record<string, string> = {};
+    const env = {
+      CLANKA_STATE: {
+        get: async (key: string) => kvStore[key] ?? null,
+        put: async (key: string, value: string, opts?: any) => {
+          kvStore[key] = value;
+          putCalls.push({ key, opts });
+        },
+      },
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    const content = Buffer.from(JSON.stringify({
+      tools: [
+        { repo: "clankamode/live-tool", criticality: "high", tier: "ops", description: "Live tool" },
+      ],
+    }), "utf8").toString("base64");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ content }), { status: 200 }));
+
+    const res = await worker.fetch(req("/tools"), env as any);
+    expect(res.status).toBe(200);
+    expect(putCalls).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        key: "registry:v1",
+        opts: expect.objectContaining({ expirationTtl: 300 }),
+      }),
+    ]));
+  });
+
+  it("returns empty tools array when GitHub fails on KV miss", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+    const env = {
+      CLANKA_STATE: createMockKV({}),
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
     const res = await worker.fetch(
       req("/tools"),
-      createEnv({ "registry:v1": JSON.stringify([]) }),
+      env as any,
     );
     const body = await json(res);
+
     expect(res.status).toBe(200);
     expect(body.tools).toEqual([]);
-    expect(body.total).toBe(0);
-    expect(body.source).toBe("registry");
+    expect(body.count).toBe(0);
+    expect(body.cached).toBe(false);
   });
 
   it("rejects non-GET with 405", async () => {
@@ -281,34 +386,25 @@ describe("Registry alignment and fallback", () => {
     const body = await json(res);
 
     expect(res.status).toBe(200);
-    expect(body.tools.map((tool: any) => tool.name)).toEqual(["alpha-tool", "zeta-tool"]);
+    expect(body.tools.map((tool: any) => tool.repo)).toEqual(["clankamode/alpha-tool", "clankamode/zeta-tool"]);
+    expect(body.cached).toBe(false);
     expect(kvStore["registry:v1"]).toBeTruthy();
-    expect(kvStore["registry:v1:stale"]).toBeTruthy();
   });
 
-  it("falls back to stale KV registry cache when GitHub API fails", async () => {
+  it("returns empty payload when GitHub API fails and primary cache is invalid", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
 
-    const staleRegistry = [
-      { repo: "clankamode/stale-tool", criticality: "high", tier: "infra", description: "Stale tool" },
-    ];
     const res = await worker.fetch(
       req("/tools"),
       createEnv({
         "registry:v1": "{invalid-json",
-        "registry:v1:stale": JSON.stringify(staleRegistry),
       }),
     );
     const body = await json(res);
 
     expect(res.status).toBe(200);
-    expect(body.total).toBe(1);
-    expect(body.tools[0]).toEqual(expect.objectContaining({
-      name: "stale-tool",
-      tier: "infra",
-      criticality: "high",
-      description: "Stale tool",
-    }));
+    expect(body.count).toBe(0);
+    expect(body.tools).toEqual([]);
   });
 
   it("filters malformed registry entries before serving /tools", async () => {
@@ -326,8 +422,166 @@ describe("Registry alignment and fallback", () => {
     const body = await json(res);
 
     expect(res.status).toBe(200);
-    expect(body.total).toBe(1);
-    expect(body.tools[0].name).toBe("good-tool");
+    expect(body.count).toBe(1);
+    expect(body.tools[0].repo).toBe("clankamode/good-tool");
+  });
+});
+
+describe("GET /changelog", () => {
+  it("returns commits and timestamp with expected shape", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([
+      {
+        sha: "abc123",
+        commit: {
+          message: "feat: add pipeline",
+          author: { name: "clanka", date: "2026-03-01T00:00:00.000Z" },
+          committer: { date: "2026-03-01T00:00:00.000Z" },
+        },
+        author: { login: "clanka" },
+      },
+    ]), { status: 200 }));
+
+    const res = await worker.fetch(req("/changelog"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      commits: expect.any(Array),
+      timestamp: expect.any(String),
+    }));
+    expect(body.commits[0]).toEqual(expect.objectContaining({
+      sha: "abc123",
+      message: "feat: add pipeline",
+      author: "clanka",
+      date: "2026-03-01T00:00:00.000Z",
+    }));
+    expect(body.commits[0]).not.toHaveProperty("url");
+    expect(Number.isNaN(Date.parse(body.timestamp))).toBe(false);
+  });
+
+  it("uses GITHUB_TOKEN authorization header", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+    const res = await worker.fetch(req("/changelog"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    expect(res.status).toBe(200);
+    const [, init] = fetchSpy.mock.calls[0];
+    const headers = (init as RequestInit)?.headers as Record<string, string>;
+    expect(headers.Authorization).toBe("Bearer gh-token");
+  });
+
+  it("serves from KV cache when changelog cache key is populated", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+    const cachedCommits = [
+      {
+        sha: "cached123",
+        message: "cached commit",
+        author: "cache-bot",
+        date: "2026-03-01T00:00:00.000Z",
+      },
+    ];
+    const res = await worker.fetch(
+      req("/changelog"),
+      createEnv({
+        "changelog:meta-runner:v1": JSON.stringify(cachedCommits),
+      }, { GITHUB_TOKEN: "gh-token" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.commits).toEqual(cachedCommits);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("writes changelog to KV with 10-minute TTL after GitHub fetch", async () => {
+    const putCalls: Array<{ key: string; opts?: any }> = [];
+    const kvStore: Record<string, string> = {};
+    const env = {
+      CLANKA_STATE: {
+        get: async (key: string) => kvStore[key] ?? null,
+        put: async (key: string, value: string, opts?: any) => {
+          kvStore[key] = value;
+          putCalls.push({ key, opts });
+        },
+      },
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([
+      {
+        sha: "abc123",
+        commit: {
+          message: "feat: add pipeline",
+          author: { name: "clanka", date: "2026-03-01T00:00:00.000Z" },
+        },
+        author: { login: "clanka" },
+      },
+    ]), { status: 200 }));
+
+    const res = await worker.fetch(req("/changelog"), env as any);
+    expect(res.status).toBe(200);
+    expect(putCalls).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        key: "changelog:meta-runner:v1",
+        opts: expect.objectContaining({ expirationTtl: 600 }),
+      }),
+    ]));
+  });
+
+  it("returns empty array and no token error when GITHUB_TOKEN is missing", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+    const res = await worker.fetch(req("/changelog"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      commits: [],
+      error: "no token",
+      timestamp: expect.any(String),
+    }));
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns empty commits when GitHub request fails", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+    const res = await worker.fetch(req("/changelog"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body.commits).toEqual([]);
+    expect(body).not.toHaveProperty("error");
+    expect(body).toHaveProperty("timestamp");
+  });
+
+  it("limits changelog response to 10 commits", async () => {
+    const commits = Array.from({ length: 12 }, (_, index) => ({
+      sha: `sha-${index}`,
+      commit: {
+        message: `commit-${index}`,
+        author: { name: "clanka", date: "2026-03-01T00:00:00.000Z" },
+      },
+      author: { login: "clanka" },
+    }));
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify(commits), { status: 200 }));
+
+    const res = await worker.fetch(req("/changelog"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body.commits).toHaveLength(10);
+  });
+
+  it("fetches from GitHub when changelog cache is invalid JSON", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+    const res = await worker.fetch(
+      req("/changelog"),
+      createEnv({
+        "changelog:meta-runner:v1": "{invalid-json",
+      }, { GITHUB_TOKEN: "gh-token" }),
+    );
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/changelog", "POST"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    expect(res.status).toBe(405);
   });
 });
 
