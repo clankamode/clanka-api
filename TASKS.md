@@ -31,7 +31,7 @@
 - [x] Add `/tools` + `/changelog` endpoint contract updates: `/tools` returns registry entries with `count/cached/timestamp` (5m KV cache), and `/changelog` now reads `clankamode/meta-runner` commits with `GITHUB_TOKEN` + 10m KV cache and no-token fallback; test suite now at 96 passing tests. (completed 2026-03-01)
 - [x] Add endpoint coverage for `/history` query behavior in `src/index.test.ts` (default limit, explicit `limit` clamping/parsing, reverse-chronological ordering, empty+KV miss behavior). (completed 2026-03-01)
 - [x] Add `/fleet/summary` regression coverage for malformed/empty `registry:v1` cache values to guarantee safe `200` responses and valid empty shape. (completed 2026-03-01)
-- [ ] Add docs in `README.md` for admin APIs (`/set-presence`, `/heartbeat`, `/admin/activity`, `/admin/tasks`) with request/response examples and required `Bearer` token flow.
+- [x] Add docs in `README.md` for admin APIs (`/set-presence`, `/heartbeat`, `/admin/activity`, `/admin/tasks`) with request/response examples and required `Bearer` token flow. (completed 2026-02-28)
 
 ## 🟢 Low Priority / Nice to Have
 - [x] Add a `README` endpoint matrix table for public/admin routes with auth, method, status code classes, and operational notes. (completed 2026-03-01)
