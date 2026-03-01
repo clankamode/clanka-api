@@ -20,13 +20,17 @@ function createMockKV(store: Record<string, string> = {}): any {
   };
 }
 
-function createEnv(extra: Record<string, string> = {}) {
+function createEnv(
+  extraKv: Record<string, string> = {},
+  extraEnv: Partial<{ ADMIN_KEY: string; GITHUB_TOKEN: string }> = {},
+) {
   return {
     CLANKA_STATE: createMockKV({
       "registry:v1": JSON.stringify(MOCK_REGISTRY),
-      ...extra,
+      ...extraKv,
     }),
     ADMIN_KEY: "test-secret",
+    ...extraEnv,
   };
 }
 
@@ -353,6 +357,349 @@ describe("GET /fleet/summary", () => {
 
   it("rejects non-GET with 405", async () => {
     const res = await worker.fetch(req("/fleet/summary", "POST"), createEnv());
+    expect(res.status).toBe(405);
+  });
+});
+
+describe("GET /fleet/health", () => {
+  it("returns GREEN when latest conclusion is success", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.includes("/repos/clankamode/clanka-api/actions/runs")) {
+        return new Response(JSON.stringify({
+          workflow_runs: [
+            {
+              conclusion: "success",
+              status: "completed",
+              updated_at: "2026-03-01T00:00:00.000Z",
+            },
+          ],
+        }), { status: 200 });
+      }
+      if (url.includes("/repos/clankamode/ci-triage/actions/runs")) {
+        return new Response(JSON.stringify({
+          workflow_runs: [
+            {
+              conclusion: "success",
+              status: "completed",
+              updated_at: "2026-03-01T00:02:00.000Z",
+            },
+          ],
+        }), { status: 200 });
+      }
+      return new Response("Not Found", { status: 404 });
+    });
+
+    const res = await worker.fetch(req("/fleet/health"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("GREEN");
+    expect(body.repos).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        repo: "clankamode/clanka-api",
+        conclusion: "success",
+      }),
+      expect.objectContaining({
+        repo: "clankamode/ci-triage",
+        conclusion: "success",
+      }),
+    ]));
+  });
+
+  it("returns RED when latest conclusion is failure", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.includes("/repos/clankamode/clanka-api/actions/runs")) {
+        return new Response(JSON.stringify({
+          workflow_runs: [
+            {
+              conclusion: "failure",
+              status: "completed",
+              updated_at: "2026-03-01T00:00:00.000Z",
+            },
+          ],
+        }), { status: 200 });
+      }
+      if (url.includes("/repos/clankamode/ci-triage/actions/runs")) {
+        return new Response(JSON.stringify({
+          workflow_runs: [
+            {
+              conclusion: "success",
+              status: "completed",
+              updated_at: "2026-03-01T00:02:00.000Z",
+            },
+          ],
+        }), { status: 200 });
+      }
+      return new Response("Not Found", { status: 404 });
+    });
+
+    const res = await worker.fetch(req("/fleet/health"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("RED");
+    expect(body.repos).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        repo: "clankamode/clanka-api",
+        conclusion: "failure",
+      }),
+    ]));
+  });
+
+  it("returns YELLOW when latest conclusion is null", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
+      workflow_runs: [
+        {
+          conclusion: null,
+          status: "in_progress",
+          updated_at: "2026-03-01T00:00:00.000Z",
+        },
+      ],
+    }), { status: 200 }));
+
+    const res = await worker.fetch(req("/fleet/health"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("YELLOW");
+    expect(body.repos).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        conclusion: "null",
+      }),
+    ]));
+  });
+
+  it("returns UNKNOWN when GITHUB_TOKEN is missing", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+
+    const res = await worker.fetch(req("/fleet/health"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("UNKNOWN");
+    expect(body.repos).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        repo: "clankamode/clanka-api",
+        conclusion: "unknown",
+      }),
+      expect.objectContaining({
+        repo: "clankamode/ci-triage",
+        conclusion: "unknown",
+      }),
+    ]));
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("uses token authorization header for GitHub Actions requests", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
+      workflow_runs: [
+        {
+          conclusion: "success",
+          status: "completed",
+          updated_at: "2026-03-01T00:00:00.000Z",
+        },
+      ],
+    }), { status: 200 }));
+
+    const res = await worker.fetch(req("/fleet/health"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    expect(res.status).toBe(200);
+
+    const [, init] = fetchSpy.mock.calls[0];
+    const headers = (init as RequestInit)?.headers as Record<string, string>;
+    expect(headers.Authorization).toBe("token gh-token");
+  });
+
+  it("caches per-repo CI runs with 10-minute TTL and reuses repo cache", async () => {
+    const kvStore: Record<string, string> = {
+      "registry:v1": JSON.stringify(MOCK_REGISTRY),
+    };
+    const putCalls: Array<{ key: string; opts?: any }> = [];
+    const env = {
+      CLANKA_STATE: {
+        get: async (key: string) => kvStore[key] ?? null,
+        put: async (key: string, value: string, opts?: any) => {
+          kvStore[key] = value;
+          putCalls.push({ key, opts });
+        },
+      },
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
+      workflow_runs: [
+        {
+          conclusion: "success",
+          status: "completed",
+          updated_at: "2026-03-01T00:00:00.000Z",
+          name: "CI",
+        },
+      ],
+    }), { status: 200 }));
+
+    const first = await worker.fetch(req("/fleet/health"), env as any);
+    expect(first.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    const ciWrites = putCalls.filter((call) => call.key.startsWith("ci:"));
+    expect(ciWrites).toHaveLength(2);
+    expect(ciWrites.map((call) => call.key).sort()).toEqual([
+      "ci:clankamode/ci-triage:v1",
+      "ci:clankamode/clanka-api:v1",
+    ]);
+    for (const call of ciWrites) {
+      expect(call.opts?.expirationTtl).toBe(600);
+    }
+
+    const freshFleet = JSON.parse(kvStore["fleet:health:v1"]);
+    kvStore["fleet:health:v1"] = JSON.stringify({
+      ...freshFleet,
+      checkedAt: "2000-01-01T00:00:00.000Z",
+    });
+
+    fetchSpy.mockClear();
+    const second = await worker.fetch(req("/fleet/health"), env as any);
+    expect(second.status).toBe(200);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns stale from KV when GitHub fails", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("GitHub unavailable"));
+    const stalePayload = {
+      status: "YELLOW",
+      repos: [
+        {
+          repo: "clankamode/clanka-api",
+          criticality: "critical",
+          lastRun: "2026-03-01T00:00:00.000Z",
+          conclusion: "failure",
+        },
+      ],
+      checkedAt: "2026-03-01T00:05:00.000Z",
+    };
+
+    const res = await worker.fetch(
+      req("/fleet/health"),
+      createEnv(
+        {
+          "fleet:health:v1": JSON.stringify(stalePayload),
+        },
+        { GITHUB_TOKEN: "gh-token" },
+      ),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(stalePayload);
+  });
+
+  it("returns 503 when both GitHub and KV fail", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("GitHub unavailable"));
+
+    const res = await worker.fetch(req("/fleet/health"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(503);
+    expect(body).toEqual({ error: "Service Unavailable" });
+  });
+
+  it("returns fresh cache without calling GitHub", async () => {
+    const now = new Date().toISOString();
+    const cachedPayload = {
+      status: "GREEN",
+      repos: [
+        {
+          repo: "clankamode/clanka-api",
+          criticality: "critical",
+          lastRun: "2026-03-01T00:00:00.000Z",
+          conclusion: "success",
+        },
+      ],
+      checkedAt: now,
+    };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+
+    const res = await worker.fetch(
+      req("/fleet/health"),
+      createEnv({
+        "fleet:health:v1": JSON.stringify(cachedPayload),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(cachedPayload);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/fleet/health", "POST"), createEnv());
+    expect(res.status).toBe(405);
+  });
+});
+
+describe("GET /history", () => {
+  it("returns capped history (max 20 entries) preserving order", async () => {
+    const history = Array.from({ length: 30 }, (_, index) => ({
+      timestamp: 2_000_000 - index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(20);
+    expect(body.history[0]).toEqual(expect.objectContaining({ desc: "event-0" }));
+    expect(body.history[19]).toEqual(expect.objectContaining({ desc: "event-19" }));
+  });
+
+  it("normalizes malformed history entries to safe defaults", async () => {
+    const res = await worker.fetch(
+      req("/history"),
+      createEnv({
+        history: JSON.stringify([
+          null,
+          { message: "from-message" },
+          { type: "SYNC", desc: "explicit", hash: "abc12345", timestamp: 12345 },
+        ]),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history[0]).toEqual(expect.objectContaining({
+      desc: "activity",
+      type: "event",
+      hash: expect.any(String),
+    }));
+    expect(body.history[1]).toEqual(expect.objectContaining({
+      desc: "from-message",
+      type: "event",
+    }));
+    expect(body.history[2]).toEqual(expect.objectContaining({
+      desc: "explicit",
+      type: "SYNC",
+      hash: "abc12345",
+      timestamp: 12345,
+    }));
+  });
+
+  it("returns empty history when no history exists", async () => {
+    const res = await worker.fetch(req("/history"), createEnv());
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ history: [] });
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/history", "POST"), createEnv());
     expect(res.status).toBe(405);
   });
 });

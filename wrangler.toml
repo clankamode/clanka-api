@@ -2,6 +2,10 @@ name = "clanka-api"
 main = "src/index.ts"
 compatibility_date = "2024-02-08"
 
+# Secret bindings (set with `npx wrangler secret put <NAME>`)
+# - ADMIN_KEY
+# - GITHUB_TOKEN
+
 [vars]
 # Public variables only
 ENVIRONMENT = "production"

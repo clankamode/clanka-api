@@ -8,7 +8,19 @@ export interface Env {
 
 type FleetTier = "ops" | "infra" | "core" | "quality" | "policy" | "template";
 type FleetCriticality = "critical" | "high" | "medium";
+type FleetHealthStatus = "GREEN" | "YELLOW" | "RED" | "UNKNOWN";
 type FleetRepo = { repo: string; criticality: FleetCriticality; tier: FleetTier };
+type FleetRepoHealth = {
+  repo: string;
+  criticality: FleetCriticality;
+  lastRun: string | null;
+  conclusion: string;
+};
+type FleetHealthPayload = {
+  status: FleetHealthStatus;
+  repos: FleetRepoHealth[];
+  checkedAt: string;
+};
 type HistoryEntry = { timestamp: number; desc: string; type: string; hash: string };
 
 type ToolStatus = "active" | "development" | "planned";
@@ -43,6 +55,11 @@ const GITHUB_STATS_TTL_SEC = 3600; // 1 hour
 const CHANGELOG_CACHE_KEY = "changelog:v1";
 const CHANGELOG_TTL_SEC = 5 * 60; // 5 minutes
 const CHANGELOG_URL = "https://api.github.com/repos/clankamode/clanka/commits?per_page=10";
+
+const FLEET_HEALTH_CACHE_KEY = "fleet:health:v1";
+const FLEET_HEALTH_TTL_SEC = 5 * 60; // 5 minutes
+const FLEET_HEALTH_TTL_MS = FLEET_HEALTH_TTL_SEC * 1000;
+const FLEET_CI_TTL_SEC = 10 * 60; // 10 minutes
 
 const RATE_LIMIT_KEY_PREFIX = "rate_limit:ip:";
 const RATE_LIMIT_WINDOW_SEC = 60;
@@ -232,6 +249,47 @@ const OPENAPI_SPEC = {
                 },
               },
             },
+          },
+          "429": {
+            description: "Too Many Requests",
+          },
+        },
+      },
+    },
+    "/fleet/health": {
+      get: {
+        summary: "Get workflow health across registered fleet repos",
+        responses: {
+          "200": {
+            description: "Fleet health payload",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    status: { type: "string", enum: ["GREEN", "YELLOW", "RED", "UNKNOWN"] },
+                    repos: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          repo: { type: "string" },
+                          criticality: { type: "string" },
+                          lastRun: { type: "string", nullable: true },
+                          conclusion: { type: "string" },
+                        },
+                        required: ["repo", "criticality", "lastRun", "conclusion"],
+                      },
+                    },
+                    checkedAt: { type: "string" },
+                  },
+                  required: ["status", "repos", "checkedAt"],
+                },
+              },
+            },
+          },
+          "503": {
+            description: "GitHub unavailable and no cache available",
           },
           "429": {
             description: "Too Many Requests",
@@ -485,6 +543,10 @@ function isFleetCriticality(value: unknown): value is FleetCriticality {
   return value === "critical" || value === "high" || value === "medium";
 }
 
+function isFleetHealthStatus(value: unknown): value is FleetHealthStatus {
+  return value === "GREEN" || value === "YELLOW" || value === "RED" || value === "UNKNOWN";
+}
+
 function normalizeRegistryEntry(entry: unknown): RegistryEntry | null {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
 
@@ -629,6 +691,218 @@ async function loadRepoTasks(env: Env, repo: string): Promise<RepoTask[]> {
   } catch {
     return [];
   }
+}
+
+function fleetStatusSeverity(status: FleetHealthStatus): number {
+  if (status === "RED") return 3;
+  if (status === "YELLOW") return 2;
+  if (status === "GREEN") return 1;
+  return 0; // UNKNOWN
+}
+
+function parseFleetHealthPayload(raw: string | null): FleetHealthPayload | null {
+  if (!raw) return null;
+  const parsed = safeParseJSON<unknown>(raw, null);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+
+  const payload = parsed as {
+    status?: unknown;
+    repos?: unknown;
+    checkedAt?: unknown;
+  };
+  if (!isFleetHealthStatus(payload.status)) return null;
+  if (typeof payload.checkedAt !== "string" || payload.checkedAt.length === 0) return null;
+  if (!Array.isArray(payload.repos)) return null;
+
+  const repos: FleetRepoHealth[] = [];
+  for (const entry of payload.repos) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+    const item = entry as {
+      repo?: unknown;
+      criticality?: unknown;
+      lastRun?: unknown;
+      conclusion?: unknown;
+    };
+    const repo = typeof item.repo === "string" ? item.repo.trim() : "";
+    const conclusion = typeof item.conclusion === "string" ? item.conclusion.trim() : "";
+    const lastRun = typeof item.lastRun === "string" ? item.lastRun : item.lastRun === null ? null : undefined;
+    if (!repo || !isFleetCriticality(item.criticality) || !conclusion || lastRun === undefined) return null;
+    repos.push({
+      repo,
+      criticality: item.criticality,
+      lastRun,
+      conclusion,
+    });
+  }
+
+  return {
+    status: payload.status,
+    repos,
+    checkedAt: payload.checkedAt,
+  };
+}
+
+function isFleetHealthFresh(payload: FleetHealthPayload): boolean {
+  const checkedAtMs = Date.parse(payload.checkedAt);
+  if (!Number.isFinite(checkedAtMs)) return false;
+  return Date.now() - checkedAtMs < FLEET_HEALTH_TTL_MS;
+}
+
+function deriveRepoHealthStatus(repo: FleetRepoHealth): FleetHealthStatus {
+  const conclusion = repo.conclusion.toLowerCase();
+  if (conclusion === "success") return "GREEN";
+  if (
+    conclusion === "failure"
+    || conclusion === "cancelled"
+    || conclusion === "timed_out"
+    || conclusion === "action_required"
+    || conclusion === "startup_failure"
+    || conclusion === "stale"
+  ) return "RED";
+  if (conclusion === "unknown") return "UNKNOWN";
+  return "YELLOW";
+}
+
+function deriveFleetHealthStatus(repos: FleetRepoHealth[]): FleetHealthStatus {
+  if (repos.length === 0) return "UNKNOWN";
+  let result: FleetHealthStatus = "UNKNOWN";
+  for (const repo of repos) {
+    const status = deriveRepoHealthStatus(repo);
+    if (fleetStatusSeverity(status) > fleetStatusSeverity(result)) {
+      result = status;
+    }
+    if (result === "RED") break;
+  }
+  return result;
+}
+
+type GithubWorkflowRun = {
+  conclusion: string | null;
+  status: string | null;
+  name: string | null;
+  updatedAt: string | null;
+};
+
+function fleetCiCacheKey(repo: string): string {
+  return `ci:${repo}:v1`;
+}
+
+function parseWorkflowRun(run: unknown): GithubWorkflowRun | null {
+  if (!run || typeof run !== "object" || Array.isArray(run)) return null;
+
+  const item = run as {
+    conclusion?: unknown;
+    status?: unknown;
+    name?: unknown;
+    updated_at?: unknown;
+    updatedAt?: unknown;
+  };
+  const conclusion = item.conclusion === null
+    ? null
+    : typeof item.conclusion === "string"
+      ? item.conclusion.trim().toLowerCase()
+      : null;
+  const status = typeof item.status === "string" ? item.status.trim().toLowerCase() : null;
+  const name = typeof item.name === "string" ? item.name.trim() : null;
+  const updatedAtRaw = typeof item.updated_at === "string"
+    ? item.updated_at
+    : typeof item.updatedAt === "string"
+      ? item.updatedAt
+      : null;
+  const updatedAt = updatedAtRaw && updatedAtRaw.length > 0 ? updatedAtRaw : null;
+  return {
+    conclusion,
+    status,
+    name,
+    updatedAt,
+  };
+}
+
+function parseWorkflowRunCache(raw: string | null): GithubWorkflowRun | null {
+  if (!raw) return null;
+  return parseWorkflowRun(safeParseJSON<unknown>(raw, null));
+}
+
+async function loadLatestWorkflowRun(env: Env, repo: string): Promise<GithubWorkflowRun | null> {
+  const cacheKey = fleetCiCacheKey(repo);
+  const cached = parseWorkflowRunCache(await env.CLANKA_STATE.get(cacheKey));
+  if (cached) return cached;
+  if (!env.GITHUB_TOKEN) return null;
+
+  const headers: Record<string, string> = {
+    "User-Agent": "clanka-api/1.0",
+    "Accept": "application/vnd.github.v3+json",
+    "Authorization": `token ${env.GITHUB_TOKEN}`,
+  };
+
+  const runListUrl = `https://api.github.com/repos/${repo}/actions/runs?per_page=1`;
+  const res = await fetch(runListUrl, { headers });
+  if (!res.ok) {
+    throw new Error(`Failed to load workflow runs for ${repo}`);
+  }
+
+  const body = await res.json() as { workflow_runs?: unknown };
+  if (!Array.isArray(body.workflow_runs) || body.workflow_runs.length === 0) {
+    const noRun: GithubWorkflowRun = {
+      conclusion: null,
+      status: null,
+      name: null,
+      updatedAt: null,
+    };
+    await env.CLANKA_STATE.put(cacheKey, JSON.stringify(noRun), {
+      expirationTtl: FLEET_CI_TTL_SEC,
+    });
+    return noRun;
+  }
+  const latestRun = parseWorkflowRun(body.workflow_runs[0]);
+  if (!latestRun) {
+    return null;
+  }
+  await env.CLANKA_STATE.put(cacheKey, JSON.stringify(latestRun), {
+    expirationTtl: FLEET_CI_TTL_SEC,
+  });
+  return latestRun;
+}
+
+function toFleetRepoHealth(
+  entry: RegistryEntry,
+  run: GithubWorkflowRun | null,
+  hasGithubToken: boolean,
+): FleetRepoHealth {
+  const conclusion = !hasGithubToken
+    ? "unknown"
+    : run?.conclusion === null
+      ? "null"
+      : run?.conclusion || "unknown";
+  const lastRun = run?.updatedAt || null;
+  return {
+    repo: entry.repo,
+    criticality: entry.criticality,
+    lastRun,
+    conclusion,
+  };
+}
+
+async function loadFleetHealthFromGithub(env: Env): Promise<FleetHealthPayload> {
+  const registryEntries = await loadRegistryEntries(env);
+  const hasGithubToken = typeof env.GITHUB_TOKEN === "string" && env.GITHUB_TOKEN.trim().length > 0;
+  const repos = await Promise.all(
+    registryEntries.map(async (entry) => {
+      const latestRun = await loadLatestWorkflowRun(env, entry.repo);
+      return toFleetRepoHealth(entry, latestRun, hasGithubToken);
+    }),
+  );
+  repos.sort((a, b) => a.repo.localeCompare(b.repo));
+
+  const payload: FleetHealthPayload = {
+    status: deriveFleetHealthStatus(repos),
+    repos,
+    checkedAt: new Date().toISOString(),
+  };
+  await env.CLANKA_STATE.put(FLEET_HEALTH_CACHE_KEY, JSON.stringify(payload), {
+    expirationTtl: FLEET_HEALTH_TTL_SEC,
+  });
+  return payload;
 }
 
 function registryEntriesToTools(entries: RegistryEntry[]): Tool[] {
@@ -1049,6 +1323,33 @@ export default {
         }),
         { headers: corsHeaders },
       );
+    }
+
+    if (url.pathname === "/fleet/health") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const cachedPayload = parseFleetHealthPayload(await env.CLANKA_STATE.get(FLEET_HEALTH_CACHE_KEY));
+      if (cachedPayload && isFleetHealthFresh(cachedPayload)) {
+        return new Response(JSON.stringify(cachedPayload), { headers: corsHeaders });
+      }
+
+      try {
+        const payload = await loadFleetHealthFromGithub(env);
+        return new Response(JSON.stringify(payload), { headers: corsHeaders });
+      } catch {
+        if (cachedPayload) {
+          return new Response(JSON.stringify(cachedPayload), { headers: corsHeaders });
+        }
+        return new Response(JSON.stringify({ error: "Service Unavailable" }), {
+          status: 503,
+          headers: corsHeaders,
+        });
+      }
     }
 
     if (url.pathname === "/pulse") {
