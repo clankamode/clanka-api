@@ -12,6 +12,7 @@ const VALID_SET_PRESENCE_PAYLOAD = {
   team: { clanka: { status: "active", task: "ship tests" } },
   activity: { type: "SYNC", desc: "presence updated" },
 };
+const STATUS_ENDPOINTS = ["/", "/fleet/summary", "/fleet/health", "/history", "/now", "/status", "/metrics"];
 
 function createMockKV(store: Record<string, string> = {}): any {
   return {
@@ -22,7 +23,7 @@ function createMockKV(store: Record<string, string> = {}): any {
 
 function createEnv(
   extraKv: Record<string, string> = {},
-  extraEnv: Partial<{ ADMIN_KEY: string; GITHUB_TOKEN: string }> = {},
+  extraEnv: Partial<{ ADMIN_KEY: string; ADMIN_TOKEN: string; GITHUB_TOKEN: string }> = {},
 ) {
   return {
     CLANKA_STATE: createMockKV({
@@ -830,42 +831,49 @@ describe("GET /openapi.json", () => {
   });
 });
 
-describe("Status regression coverage", () => {
-  const thresholdMs = 10 * 60 * 1000;
-
-  it("GET /status returns offline when LAST_SEEN_KEY is missing", async () => {
+describe("GET /status", () => {
+  it("returns the public status contract shape", async () => {
     const res = await worker.fetch(req("/status"), createEnv());
     const body = await json(res);
     expect(res.status).toBe(200);
-    expect(body).toEqual({ status: "offline" });
+    expect(body).toEqual({
+      ok: true,
+      version: "1.0.0",
+      timestamp: expect.any(String),
+      endpoints: STATUS_ENDPOINTS,
+    });
+    expect(Number.isNaN(Date.parse(body.timestamp))).toBe(false);
   });
 
-  it("GET /status returns operational at the offline threshold boundary", async () => {
-    const now = 1_750_000_000_000;
-    vi.spyOn(Date, "now").mockReturnValue(now);
-    const res = await worker.fetch(
-      req("/status"),
-      createEnv({ last_seen: String(now - thresholdMs) }),
-    );
+  it("disables caching for status", async () => {
+    const res = await worker.fetch(req("/status"), createEnv());
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("returns CORS headers", async () => {
+    const res = await worker.fetch(req("/status"), createEnv());
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/status", "POST"), createEnv());
     const body = await json(res);
-    expect(res.status).toBe(200);
-    expect(body).toEqual(expect.objectContaining({ status: "operational" }));
-    expect(body.last_seen).toBe(new Date(now - thresholdMs).toISOString());
+    expect(res.status).toBe(405);
+    expect(body).toEqual({ error: "Method Not Allowed" });
   });
 
-  it("GET /status returns offline when LAST_SEEN_KEY is beyond threshold", async () => {
-    const now = 1_750_000_000_000;
-    vi.spyOn(Date, "now").mockReturnValue(now);
-    const res = await worker.fetch(
-      req("/status"),
-      createEnv({ last_seen: String(now - thresholdMs - 1) }),
-    );
+  it("includes /metrics and /status in endpoint list", async () => {
+    const res = await worker.fetch(req("/status"), createEnv());
     const body = await json(res);
-    expect(res.status).toBe(200);
-    expect(body).toEqual({ status: "offline" });
+    expect(body.endpoints).toContain("/status");
+    expect(body.endpoints).toContain("/metrics");
   });
+});
 
-  it("GET /status/uptime returns operational with uptime_ms when heartbeat is fresh", async () => {
+describe("GET /status/uptime regression coverage", () => {
+  const thresholdMs = 10 * 60 * 1000;
+
+  it("returns operational with uptime_ms when heartbeat is fresh", async () => {
     const now = 1_750_000_000_000;
     const lastSeen = now - 1234;
     vi.spyOn(Date, "now").mockReturnValue(now);
@@ -882,7 +890,7 @@ describe("Status regression coverage", () => {
     }));
   });
 
-  it("GET /status/uptime returns offline when heartbeat is stale", async () => {
+  it("returns offline when heartbeat is stale", async () => {
     const now = 1_750_000_000_000;
     vi.spyOn(Date, "now").mockReturnValue(now);
     const res = await worker.fetch(
@@ -892,6 +900,113 @@ describe("Status regression coverage", () => {
     const body = await json(res);
     expect(res.status).toBe(200);
     expect(body).toEqual({ status: "offline", uptime_ms: 0, last_seen: null });
+  });
+});
+
+describe("GET /metrics", () => {
+  it("returns 401 when token is missing", async () => {
+    const res = await worker.fetch(
+      req("/metrics"),
+      createEnv({}, { ADMIN_TOKEN: "metrics-secret" }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(401);
+    expect(body).toEqual({ error: "unauthorized" });
+  });
+
+  it("returns 401 when token is wrong", async () => {
+    const res = await worker.fetch(
+      req("/metrics", "GET", undefined, { "X-Admin-Token": "wrong-token" }),
+      createEnv({}, { ADMIN_TOKEN: "metrics-secret" }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(401);
+    expect(body).toEqual({ error: "unauthorized" });
+  });
+
+  it("returns 200 with metrics shape when token is correct", async () => {
+    const res = await worker.fetch(
+      req("/metrics", "GET", undefined, { "X-Admin-Token": "metrics-secret" }),
+      createEnv({}, { ADMIN_TOKEN: "metrics-secret" }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      uptime_ms: expect.any(Number),
+      requests_total: expect.any(Number),
+      kv_hits: expect.any(Number),
+      kv_misses: expect.any(Number),
+      timestamp: expect.any(String),
+    }));
+    expect(Number.isNaN(Date.parse(body.timestamp))).toBe(false);
+  });
+
+  it("returns 503 when ADMIN_TOKEN is missing", async () => {
+    const res = await worker.fetch(req("/metrics"), createEnv());
+    const body = await json(res);
+    expect(res.status).toBe(503);
+    expect(body).toEqual({ error: "metrics_unavailable" });
+  });
+
+  it("disables caching for authorized metrics responses", async () => {
+    const res = await worker.fetch(
+      req("/metrics", "GET", undefined, { "X-Admin-Token": "metrics-secret" }),
+      createEnv({}, { ADMIN_TOKEN: "metrics-secret" }),
+    );
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("disables caching for unauthorized metrics responses", async () => {
+    const res = await worker.fetch(
+      req("/metrics"),
+      createEnv({}, { ADMIN_TOKEN: "metrics-secret" }),
+    );
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(
+      req("/metrics", "POST"),
+      createEnv({}, { ADMIN_TOKEN: "metrics-secret" }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(405);
+    expect(body).toEqual({ error: "Method Not Allowed" });
+  });
+
+  it("returns non-negative numeric counters", async () => {
+    const res = await worker.fetch(
+      req("/metrics", "GET", undefined, { "X-Admin-Token": "metrics-secret" }),
+      createEnv({}, { ADMIN_TOKEN: "metrics-secret" }),
+    );
+    const body = await json(res);
+    expect(body.requests_total).toBeGreaterThanOrEqual(0);
+    expect(body.kv_hits).toBeGreaterThanOrEqual(0);
+    expect(body.kv_misses).toBeGreaterThanOrEqual(0);
+  });
+
+  it("falls back to in-memory counters when KV is unavailable", async () => {
+    const env = {
+      CLANKA_STATE: {
+        get: async () => { throw new Error("kv unavailable"); },
+        put: async () => { throw new Error("kv unavailable"); },
+      },
+      ADMIN_KEY: "test-secret",
+      ADMIN_TOKEN: "metrics-secret",
+    };
+    const res = await worker.fetch(
+      req("/metrics", "GET", undefined, { "X-Admin-Token": "metrics-secret" }),
+      env as any,
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      uptime_ms: expect.any(Number),
+      requests_total: expect.any(Number),
+      kv_hits: expect.any(Number),
+      kv_misses: expect.any(Number),
+      timestamp: expect.any(String),
+    }));
   });
 });
 
