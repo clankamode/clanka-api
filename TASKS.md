@@ -1,5 +1,5 @@
 # TASKS.md — clanka-api
-> Last updated: 2026-02-25 | Status: open
+> Last updated: 2026-03-01 | Status: open
 
 ## 🔴 High Priority
 - [x] **Deploy to Cloudflare** — live at https://clanka-api.clankamode.workers.dev (deployed 2026-02-26)
@@ -23,8 +23,8 @@
 - [x] Add regression tests for `/status` and `/status/uptime` to verify online/offline behavior around `LAST_SEEN_KEY` and `STATUS_OFFLINE_THRESHOLD_MS`. (completed 2026-02-28)
 
 ## 🟡 Medium Priority
-- [ ] Add contract tests for `/now` and `/pulse` in `src/index.test.ts` to assert exact response shape, required fields, and deterministic presence of `status`, `last_seen`, and `signal`.
-- [ ] Add fleet metadata tests for `/fleet/summary` to verify tier/criticality grouping, total repo count, and deterministic ordering.
+- [x] Add contract tests for `/now` and `/pulse` in `src/index.test.ts` to assert exact response shape, required fields, and deterministic presence of `status`, `last_seen`, and `signal`. (completed 2026-03-01)
+- [x] Add fleet metadata tests for `/fleet/summary` to verify tier/criticality grouping, total repo count, and deterministic ordering. (completed 2026-03-01)
 - [ ] Add endpoint coverage for `/history` query behavior in `src/index.test.ts` (e.g., default limit, explicit limit clamping, and reverse-chronological ordering).
 - [ ] Add docs in `README.md` for admin APIs (`/set-presence`, `/heartbeat`, `/admin/activity`, `/admin/tasks`) with request/response examples and required `Bearer` token flow.
 
