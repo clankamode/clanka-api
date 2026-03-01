@@ -3,16 +3,27 @@ import { loadGithubEvents } from "./github-events";
 export interface Env {
   CLANKA_STATE: KVNamespace;
   ADMIN_KEY: string;
+  ADMIN_TOKEN?: string;
   GITHUB_TOKEN?: string;
 }
 
 type FleetTier = "ops" | "infra" | "core" | "quality" | "policy" | "template";
 type FleetCriticality = "critical" | "high" | "medium";
+type FleetHealthStatus = "GREEN" | "YELLOW" | "RED" | "UNKNOWN";
 type FleetRepo = { repo: string; criticality: FleetCriticality; tier: FleetTier };
+type FleetRepoHealth = {
+  repo: string;
+  criticality: FleetCriticality;
+  lastRun: string | null;
+  conclusion: string;
+};
+type FleetHealthPayload = {
+  status: FleetHealthStatus;
+  repos: FleetRepoHealth[];
+  checkedAt: string;
+};
 type HistoryEntry = { timestamp: number; desc: string; type: string; hash: string };
 
-type ToolStatus = "active" | "development" | "planned";
-type Tool = { name: string; description: string; status: ToolStatus; tier?: string; criticality?: string };
 type Project = { name: string; description: string; url: string; status: string; last_updated: string };
 type RequestLogEntry = { timestamp: number; method: string; pathname: string; query: string; ip: string; ua?: string };
 type ChangelogEntry = {
@@ -20,7 +31,6 @@ type ChangelogEntry = {
   message: string;
   author: string;
   date: string;
-  url: string;
 };
 
 const HISTORY_LIMIT = 20;
@@ -29,6 +39,7 @@ const REGISTRY_CACHE_KEY = "registry:v1";
 const REGISTRY_STALE_CACHE_KEY = `${REGISTRY_CACHE_KEY}:stale`;
 const REGISTRY_TTL_SEC = 3600; // 1 hour
 const REGISTRY_STALE_TTL_SEC = 7 * 24 * 60 * 60; // 7 days
+const TOOLS_REGISTRY_TTL_SEC = 5 * 60; // 5 minutes
 
 const REQUEST_LOG_KEY = "request_log";
 const REQUEST_LOG_TTL_SEC = 24 * 60 * 60; // 24h
@@ -40,20 +51,29 @@ const STATUS_OFFLINE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
 const GITHUB_STATS_CACHE_KEY = "github:stats:v1";
 const GITHUB_STATS_TTL_SEC = 3600; // 1 hour
 
-const CHANGELOG_CACHE_KEY = "changelog:v1";
-const CHANGELOG_TTL_SEC = 5 * 60; // 5 minutes
-const CHANGELOG_URL = "https://api.github.com/repos/clankamode/clanka/commits?per_page=10";
+const CHANGELOG_CACHE_KEY = "changelog:meta-runner:v1";
+const CHANGELOG_TTL_SEC = 10 * 60; // 10 minutes
+const CHANGELOG_URL = "https://api.github.com/repos/clankamode/meta-runner/commits?per_page=10";
+
+const FLEET_HEALTH_CACHE_KEY = "fleet:health:v1";
+const FLEET_HEALTH_TTL_SEC = 5 * 60; // 5 minutes
+const FLEET_HEALTH_TTL_MS = FLEET_HEALTH_TTL_SEC * 1000;
+const FLEET_CI_TTL_SEC = 10 * 60; // 10 minutes
 
 const RATE_LIMIT_KEY_PREFIX = "rate_limit:ip:";
 const RATE_LIMIT_WINDOW_SEC = 60;
 const RATE_LIMIT_WINDOW_MS = RATE_LIMIT_WINDOW_SEC * 1000;
 const RATE_LIMIT_MAX_REQUESTS = 60;
+const METRICS_KEY = "metrics:v1";
+const API_VERSION = "1.0.0";
+const STATUS_ENDPOINTS = ["/", "/fleet/summary", "/fleet/health", "/history", "/now", "/status", "/metrics"];
+const startTime = Date.now();
 
 const OPENAPI_SPEC = {
   openapi: "3.0.3",
   info: {
     title: "clanka-api",
-    version: "1.0.0",
+    version: API_VERSION,
     description: "Edge API for Clanka public endpoints",
   },
   paths: {
@@ -177,19 +197,19 @@ const OPENAPI_SPEC = {
                       items: {
                         type: "object",
                         properties: {
-                          name: { type: "string" },
+                          repo: { type: "string" },
                           description: { type: "string" },
-                          status: { type: "string" },
                           tier: { type: "string" },
                           criticality: { type: "string" },
                         },
-                        required: ["name", "description", "status"],
+                        required: ["repo", "description", "tier", "criticality"],
                       },
                     },
-                    total: { type: "number" },
-                    source: { type: "string" },
+                    count: { type: "number" },
+                    cached: { type: "boolean" },
+                    timestamp: { type: "string" },
                   },
-                  required: ["tools", "total", "source"],
+                  required: ["tools", "count", "cached", "timestamp"],
                 },
               },
             },
@@ -239,6 +259,47 @@ const OPENAPI_SPEC = {
         },
       },
     },
+    "/fleet/health": {
+      get: {
+        summary: "Get workflow health across registered fleet repos",
+        responses: {
+          "200": {
+            description: "Fleet health payload",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    status: { type: "string", enum: ["GREEN", "YELLOW", "RED", "UNKNOWN"] },
+                    repos: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          repo: { type: "string" },
+                          criticality: { type: "string" },
+                          lastRun: { type: "string", nullable: true },
+                          conclusion: { type: "string" },
+                        },
+                        required: ["repo", "criticality", "lastRun", "conclusion"],
+                      },
+                    },
+                    checkedAt: { type: "string" },
+                  },
+                  required: ["status", "repos", "checkedAt"],
+                },
+              },
+            },
+          },
+          "503": {
+            description: "GitHub unavailable and no cache available",
+          },
+          "429": {
+            description: "Too Many Requests",
+          },
+        },
+      },
+    },
     "/changelog": {
       get: {
         summary: "Get recent commit changelog",
@@ -259,13 +320,14 @@ const OPENAPI_SPEC = {
                           message: { type: "string" },
                           author: { type: "string" },
                           date: { type: "string" },
-                          url: { type: "string" },
                         },
-                        required: ["sha", "message", "author", "date", "url"],
+                        required: ["sha", "message", "author", "date"],
                       },
                     },
+                    timestamp: { type: "string" },
+                    error: { type: "string" },
                   },
-                  required: ["commits"],
+                  required: ["commits", "timestamp"],
                 },
               },
             },
@@ -303,6 +365,20 @@ type RateLimitState = {
   count: number;
   resetAt: number;
 };
+type MetricsState = {
+  requests_total: number;
+  kv_hits: number;
+  kv_misses: number;
+};
+type WorkerExecutionContext = {
+  waitUntil(promise: Promise<unknown>): void;
+};
+
+const inMemoryMetrics: MetricsState = {
+  requests_total: 0,
+  kv_hits: 0,
+  kv_misses: 0,
+};
 
 function decodeBase64(value: string): string {
   const normalized = value.replace(/\n/g, "");
@@ -325,7 +401,7 @@ function getClientIp(request: Request): string {
 }
 
 function isPublicGetEndpoint(pathname: string): boolean {
-  return pathname !== "/set-presence" && !pathname.startsWith("/admin");
+  return pathname !== "/set-presence" && pathname !== "/metrics" && !pathname.startsWith("/admin");
 }
 
 async function checkRateLimit(env: Env, request: Request): Promise<{ allowed: boolean; retryAfter: number }> {
@@ -349,6 +425,79 @@ async function checkRateLimit(env: Env, request: Request): Promise<{ allowed: bo
   const next = { ...current, count: current.count + 1 };
   await env.CLANKA_STATE.put(key, JSON.stringify(next), { expirationTtl: RATE_LIMIT_WINDOW_SEC });
   return { allowed: true, retryAfter: Math.max(1, Math.ceil((next.resetAt - now) / 1000)) };
+}
+
+function toCounter(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
+  return Math.floor(value);
+}
+
+function parseMetricsState(raw: string | null): MetricsState {
+  if (!raw) {
+    return { requests_total: 0, kv_hits: 0, kv_misses: 0 };
+  }
+
+  const parsed = safeParseJSON<unknown>(raw, null);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { requests_total: 0, kv_hits: 0, kv_misses: 0 };
+  }
+
+  const item = parsed as Record<string, unknown>;
+  return {
+    requests_total: toCounter(item.requests_total),
+    kv_hits: toCounter(item.kv_hits),
+    kv_misses: toCounter(item.kv_misses),
+  };
+}
+
+function mergeMetricsState(a: MetricsState, b: MetricsState): MetricsState {
+  return {
+    requests_total: Math.max(a.requests_total, b.requests_total),
+    kv_hits: Math.max(a.kv_hits, b.kv_hits),
+    kv_misses: Math.max(a.kv_misses, b.kv_misses),
+  };
+}
+
+async function incrementMetrics(env: Env): Promise<void> {
+  inMemoryMetrics.requests_total += 1;
+  if (!env.CLANKA_STATE || typeof env.CLANKA_STATE.get !== "function" || typeof env.CLANKA_STATE.put !== "function") {
+    inMemoryMetrics.kv_misses += 1;
+    return;
+  }
+
+  try {
+    const raw = await env.CLANKA_STATE.get(METRICS_KEY);
+    const persisted = parseMetricsState(raw);
+    const hasPersistedMetrics = typeof raw === "string" && raw.length > 0;
+    const next = mergeMetricsState(inMemoryMetrics, {
+      requests_total: persisted.requests_total + 1,
+      kv_hits: persisted.kv_hits + (hasPersistedMetrics ? 1 : 0),
+      kv_misses: persisted.kv_misses + (hasPersistedMetrics ? 0 : 1),
+    });
+
+    inMemoryMetrics.requests_total = next.requests_total;
+    inMemoryMetrics.kv_hits = next.kv_hits;
+    inMemoryMetrics.kv_misses = next.kv_misses;
+    await env.CLANKA_STATE.put(METRICS_KEY, JSON.stringify(next));
+  } catch {
+    inMemoryMetrics.kv_misses += 1;
+  }
+}
+
+async function loadMetrics(env: Env): Promise<MetricsState> {
+  if (!env.CLANKA_STATE || typeof env.CLANKA_STATE.get !== "function") {
+    return { ...inMemoryMetrics };
+  }
+
+  try {
+    const raw = await env.CLANKA_STATE.get(METRICS_KEY);
+    if (!raw) {
+      return { ...inMemoryMetrics };
+    }
+    return mergeMetricsState(inMemoryMetrics, parseMetricsState(raw));
+  } catch {
+    return { ...inMemoryMetrics };
+  }
 }
 
 function getStatusPayload(lastSeenRaw: string | null) {
@@ -413,20 +562,81 @@ function isAuthorized(request: Request, env: Env): boolean {
   return auth === expected;
 }
 
-async function loadChangelog(env: Env): Promise<ChangelogEntry[]> {
-  const cached = await env.CLANKA_STATE.get(CHANGELOG_CACHE_KEY);
-  if (cached) {
-    try {
-      return JSON.parse(cached) as ChangelogEntry[];
-    } catch {
-      // fall through to fetch
-    }
+function normalizeChangelogEntry(entry: unknown): ChangelogEntry | null {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+
+  const item = entry as {
+    sha?: unknown;
+    message?: unknown;
+    author?: unknown;
+    date?: unknown;
+    commit?: {
+      message?: unknown;
+      author?: { name?: unknown; date?: unknown };
+      committer?: { date?: unknown };
+    };
+  };
+
+  const directSha = typeof item.sha === "string" ? item.sha.trim() : "";
+  const directMessage = typeof item.message === "string" ? item.message : "";
+  const directAuthor = typeof item.author === "string" ? item.author : "";
+  const directDate = typeof item.date === "string" ? item.date : "";
+  if (directSha && directMessage && directAuthor && directDate) {
+    return {
+      sha: directSha,
+      message: directMessage,
+      author: directAuthor,
+      date: directDate,
+    };
   }
+
+  const commit = item.commit && typeof item.commit === "object" && !Array.isArray(item.commit)
+    ? item.commit
+    : undefined;
+  const message = typeof commit?.message === "string" ? commit.message : "";
+  const author = item.author && typeof item.author === "object" && !Array.isArray(item.author)
+    && typeof (item.author as { login?: unknown }).login === "string"
+    ? (item.author as { login: string }).login
+    : typeof commit?.author?.name === "string"
+      ? commit.author.name
+      : "unknown";
+  const date = typeof commit?.author?.date === "string"
+    ? commit.author.date
+    : typeof commit?.committer?.date === "string"
+      ? commit.committer.date
+      : new Date().toISOString();
+  if (!directSha) return null;
+  return {
+    sha: directSha,
+    message,
+    author,
+    date,
+  };
+}
+
+function parseChangelogEntries(raw: string | null): ChangelogEntry[] | null {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return null;
+    return parsed
+      .slice(0, 10)
+      .map((entry) => normalizeChangelogEntry(entry))
+      .filter((entry): entry is ChangelogEntry => Boolean(entry));
+  } catch {
+    return null;
+  }
+}
+
+async function loadChangelog(env: Env): Promise<ChangelogEntry[]> {
+  const cached = parseChangelogEntries(await env.CLANKA_STATE.get(CHANGELOG_CACHE_KEY));
+  if (cached !== null) return cached;
 
   const headers: Record<string, string> = {
     "User-Agent": "clanka-api/1.0",
     "Accept": "application/vnd.github.v3+json",
   };
+  if (env.GITHUB_TOKEN) headers["Authorization"] = `Bearer ${env.GITHUB_TOKEN}`;
 
   const res = await fetch(CHANGELOG_URL, { headers });
   if (!res.ok) return [];
@@ -436,34 +646,7 @@ async function loadChangelog(env: Env): Promise<ChangelogEntry[]> {
 
   const payload = body
     .slice(0, 10)
-    .map((item) => {
-      if (!item || typeof item !== "object") return null;
-      const commitInfo = (item as { commit?: { message?: string; author?: { name?: string; date?: string }; committer?: { date?: string } }; author?: { login?: string }; sha?: string; html_url?: string });
-      const commit = commitInfo.commit || {};
-      const commitAuthor = commitInfo.author;
-      const htmlUrl = typeof commitInfo.html_url === "string" ? commitInfo.html_url : "";
-      const sha = typeof commitInfo.sha === "string" ? commitInfo.sha : "";
-      const message = typeof commit.message === "string" ? commit.message : "";
-      const author = typeof commitAuthor?.login === "string"
-        ? commitAuthor.login
-        : typeof commit.author?.name === "string"
-          ? commit.author.name
-          : "unknown";
-      const date = typeof commit.author?.date === "string"
-        ? commit.author.date
-        : typeof commit.committer?.date === "string"
-          ? commit.committer.date
-          : new Date().toISOString();
-
-      if (!sha) return null;
-      return {
-        sha,
-        message,
-        author,
-        date,
-        url: htmlUrl || `https://github.com/clankamode/clanka/commit/${sha}`,
-      };
-    })
+    .map((entry) => normalizeChangelogEntry(entry))
     .filter((entry): entry is ChangelogEntry => Boolean(entry));
 
   await env.CLANKA_STATE.put(CHANGELOG_CACHE_KEY, JSON.stringify(payload), {
@@ -483,6 +666,10 @@ function isFleetTier(value: unknown): value is FleetTier {
 
 function isFleetCriticality(value: unknown): value is FleetCriticality {
   return value === "critical" || value === "high" || value === "medium";
+}
+
+function isFleetHealthStatus(value: unknown): value is FleetHealthStatus {
+  return value === "GREEN" || value === "YELLOW" || value === "RED" || value === "UNKNOWN";
 }
 
 function normalizeRegistryEntry(entry: unknown): RegistryEntry | null {
@@ -578,6 +765,37 @@ async function loadRegistryEntries(env: Env): Promise<RegistryEntry[]> {
   }
 }
 
+async function loadToolsRegistryEntries(env: Env): Promise<{ entries: RegistryEntry[]; cached: boolean }> {
+  const cachedEntries = parseRegistryEntries(await env.CLANKA_STATE.get(REGISTRY_CACHE_KEY));
+  if (cachedEntries !== null) {
+    return { entries: cachedEntries, cached: true };
+  }
+
+  try {
+    const headers: Record<string, string> = {
+      "User-Agent": "clanka-api/1.0",
+      "Accept": "application/vnd.github.v3+json",
+    };
+    if (env.GITHUB_TOKEN) headers["Authorization"] = `Bearer ${env.GITHUB_TOKEN}`;
+
+    const res = await fetch(REGISTRY_URL, { headers });
+    if (!res.ok) return { entries: [], cached: false };
+    const meta = await res.json() as { content?: string };
+    if (typeof meta.content !== "string" || meta.content.length === 0) {
+      return { entries: [], cached: false };
+    }
+
+    const decoded = decodeBase64(meta.content);
+    const entries = extractRegistryEntries(JSON.parse(decoded) as unknown);
+    await env.CLANKA_STATE.put(REGISTRY_CACHE_KEY, JSON.stringify(entries), {
+      expirationTtl: TOOLS_REGISTRY_TTL_SEC,
+    });
+    return { entries, cached: false };
+  } catch {
+    return { entries: [], cached: false };
+  }
+}
+
 function parseOpenTasksMarkdown(markdown: string): RepoTask[] {
   const lines = markdown.split(/\r?\n/);
   const tasks: RepoTask[] = [];
@@ -631,14 +849,216 @@ async function loadRepoTasks(env: Env, repo: string): Promise<RepoTask[]> {
   }
 }
 
-function registryEntriesToTools(entries: RegistryEntry[]): Tool[] {
-  return entries.map((e) => ({
-    name: e.repo.replace("clankamode/", ""),
-    description: e.description ?? `${e.tier} tool — ${e.criticality} criticality`,
-    status: "active" as ToolStatus,
-    tier: e.tier,
-    criticality: e.criticality,
-  }));
+function fleetStatusSeverity(status: FleetHealthStatus): number {
+  if (status === "RED") return 3;
+  if (status === "YELLOW") return 2;
+  if (status === "GREEN") return 1;
+  return 0; // UNKNOWN
+}
+
+function parseFleetHealthPayload(raw: string | null): FleetHealthPayload | null {
+  if (!raw) return null;
+  const parsed = safeParseJSON<unknown>(raw, null);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+
+  const payload = parsed as {
+    status?: unknown;
+    repos?: unknown;
+    checkedAt?: unknown;
+  };
+  if (!isFleetHealthStatus(payload.status)) return null;
+  if (typeof payload.checkedAt !== "string" || payload.checkedAt.length === 0) return null;
+  if (!Array.isArray(payload.repos)) return null;
+
+  const repos: FleetRepoHealth[] = [];
+  for (const entry of payload.repos) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+    const item = entry as {
+      repo?: unknown;
+      criticality?: unknown;
+      lastRun?: unknown;
+      conclusion?: unknown;
+    };
+    const repo = typeof item.repo === "string" ? item.repo.trim() : "";
+    const conclusion = typeof item.conclusion === "string" ? item.conclusion.trim() : "";
+    const lastRun = typeof item.lastRun === "string" ? item.lastRun : item.lastRun === null ? null : undefined;
+    if (!repo || !isFleetCriticality(item.criticality) || !conclusion || lastRun === undefined) return null;
+    repos.push({
+      repo,
+      criticality: item.criticality,
+      lastRun,
+      conclusion,
+    });
+  }
+
+  return {
+    status: payload.status,
+    repos,
+    checkedAt: payload.checkedAt,
+  };
+}
+
+function isFleetHealthFresh(payload: FleetHealthPayload): boolean {
+  const checkedAtMs = Date.parse(payload.checkedAt);
+  if (!Number.isFinite(checkedAtMs)) return false;
+  return Date.now() - checkedAtMs < FLEET_HEALTH_TTL_MS;
+}
+
+function deriveRepoHealthStatus(repo: FleetRepoHealth): FleetHealthStatus {
+  const conclusion = repo.conclusion.toLowerCase();
+  if (conclusion === "success") return "GREEN";
+  if (
+    conclusion === "failure"
+    || conclusion === "cancelled"
+    || conclusion === "timed_out"
+    || conclusion === "action_required"
+    || conclusion === "startup_failure"
+    || conclusion === "stale"
+  ) return "RED";
+  if (conclusion === "unknown") return "UNKNOWN";
+  return "YELLOW";
+}
+
+function deriveFleetHealthStatus(repos: FleetRepoHealth[]): FleetHealthStatus {
+  if (repos.length === 0) return "UNKNOWN";
+  let result: FleetHealthStatus = "UNKNOWN";
+  for (const repo of repos) {
+    const status = deriveRepoHealthStatus(repo);
+    if (fleetStatusSeverity(status) > fleetStatusSeverity(result)) {
+      result = status;
+    }
+    if (result === "RED") break;
+  }
+  return result;
+}
+
+type GithubWorkflowRun = {
+  conclusion: string | null;
+  status: string | null;
+  name: string | null;
+  updatedAt: string | null;
+};
+
+function fleetCiCacheKey(repo: string): string {
+  return `ci:${repo}:v1`;
+}
+
+function parseWorkflowRun(run: unknown): GithubWorkflowRun | null {
+  if (!run || typeof run !== "object" || Array.isArray(run)) return null;
+
+  const item = run as {
+    conclusion?: unknown;
+    status?: unknown;
+    name?: unknown;
+    updated_at?: unknown;
+    updatedAt?: unknown;
+  };
+  const conclusion = item.conclusion === null
+    ? null
+    : typeof item.conclusion === "string"
+      ? item.conclusion.trim().toLowerCase()
+      : null;
+  const status = typeof item.status === "string" ? item.status.trim().toLowerCase() : null;
+  const name = typeof item.name === "string" ? item.name.trim() : null;
+  const updatedAtRaw = typeof item.updated_at === "string"
+    ? item.updated_at
+    : typeof item.updatedAt === "string"
+      ? item.updatedAt
+      : null;
+  const updatedAt = updatedAtRaw && updatedAtRaw.length > 0 ? updatedAtRaw : null;
+  return {
+    conclusion,
+    status,
+    name,
+    updatedAt,
+  };
+}
+
+function parseWorkflowRunCache(raw: string | null): GithubWorkflowRun | null {
+  if (!raw) return null;
+  return parseWorkflowRun(safeParseJSON<unknown>(raw, null));
+}
+
+async function loadLatestWorkflowRun(env: Env, repo: string): Promise<GithubWorkflowRun | null> {
+  const cacheKey = fleetCiCacheKey(repo);
+  const cached = parseWorkflowRunCache(await env.CLANKA_STATE.get(cacheKey));
+  if (cached) return cached;
+  if (!env.GITHUB_TOKEN) return null;
+
+  const headers: Record<string, string> = {
+    "User-Agent": "clanka-api/1.0",
+    "Accept": "application/vnd.github.v3+json",
+    "Authorization": `token ${env.GITHUB_TOKEN}`,
+  };
+
+  const runListUrl = `https://api.github.com/repos/${repo}/actions/runs?per_page=1`;
+  const res = await fetch(runListUrl, { headers });
+  if (!res.ok) {
+    throw new Error(`Failed to load workflow runs for ${repo}`);
+  }
+
+  const body = await res.json() as { workflow_runs?: unknown };
+  if (!Array.isArray(body.workflow_runs) || body.workflow_runs.length === 0) {
+    const noRun: GithubWorkflowRun = {
+      conclusion: null,
+      status: null,
+      name: null,
+      updatedAt: null,
+    };
+    await env.CLANKA_STATE.put(cacheKey, JSON.stringify(noRun), {
+      expirationTtl: FLEET_CI_TTL_SEC,
+    });
+    return noRun;
+  }
+  const latestRun = parseWorkflowRun(body.workflow_runs[0]);
+  if (!latestRun) {
+    return null;
+  }
+  await env.CLANKA_STATE.put(cacheKey, JSON.stringify(latestRun), {
+    expirationTtl: FLEET_CI_TTL_SEC,
+  });
+  return latestRun;
+}
+
+function toFleetRepoHealth(
+  entry: RegistryEntry,
+  run: GithubWorkflowRun | null,
+  hasGithubToken: boolean,
+): FleetRepoHealth {
+  const conclusion = !hasGithubToken
+    ? "unknown"
+    : run?.conclusion === null
+      ? "null"
+      : run?.conclusion || "unknown";
+  const lastRun = run?.updatedAt || null;
+  return {
+    repo: entry.repo,
+    criticality: entry.criticality,
+    lastRun,
+    conclusion,
+  };
+}
+
+async function loadFleetHealthFromGithub(env: Env): Promise<FleetHealthPayload> {
+  const registryEntries = await loadRegistryEntries(env);
+  const hasGithubToken = typeof env.GITHUB_TOKEN === "string" && env.GITHUB_TOKEN.trim().length > 0;
+  const repos = await Promise.all(
+    registryEntries.map(async (entry) => {
+      const latestRun = await loadLatestWorkflowRun(env, entry.repo);
+      return toFleetRepoHealth(entry, latestRun, hasGithubToken);
+    }),
+  );
+  repos.sort((a, b) => a.repo.localeCompare(b.repo));
+
+  const payload: FleetHealthPayload = {
+    status: deriveFleetHealthStatus(repos),
+    repos,
+    checkedAt: new Date().toISOString(),
+  };
+  await env.CLANKA_STATE.put(FLEET_HEALTH_CACHE_KEY, JSON.stringify(payload), {
+    expirationTtl: FLEET_HEALTH_TTL_SEC,
+  });
+  return payload;
 }
 
 function registryEntriesToProjects(entries: RegistryEntry[]): Project[] {
@@ -779,7 +1199,7 @@ function countActiveAgents(team: unknown): number {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: WorkerExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // Helper for CORS headers
@@ -787,8 +1207,19 @@ export default {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Token",
     };
+    const noCacheHeaders = {
+      ...corsHeaders,
+      "Cache-Control": "no-store",
+    };
+
+    const metricsUpdate = incrementMetrics(env);
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(metricsUpdate);
+    } else {
+      void metricsUpdate;
+    }
 
     try {
       await logRequest(env, request);
@@ -960,17 +1391,71 @@ export default {
         });
       }
 
-      const historyRaw = await env.CLANKA_STATE.get("history") || "[]";
-      const history = normalizeHistory(safeParseJSON<unknown[]>(historyRaw, []));
+      const rawLimit = Number(url.searchParams.get("limit"));
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0
+        ? Math.min(HISTORY_LIMIT, Math.floor(rawLimit))
+        : HISTORY_LIMIT;
 
-      return new Response(JSON.stringify({ history: history.slice(0, HISTORY_LIMIT) }), {
+      const historyRaw = await env.CLANKA_STATE.get("history");
+      const historySource = safeParseJSON<unknown[]>(historyRaw, []);
+      const history = (Array.isArray(historySource) ? historySource : [])
+        .map((entry, index) => toHistoryEntry(entry, Date.now() - index))
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, limit);
+
+      return new Response(JSON.stringify({ history, count: history.length }), {
         headers: corsHeaders,
       });
     }
 
     if (url.pathname === "/status") {
-      const lastSeenRaw = await env.CLANKA_STATE.get(LAST_SEEN_KEY);
-      return new Response(JSON.stringify(getStatusPayload(lastSeenRaw)), { headers: corsHeaders });
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      return new Response(JSON.stringify({
+        ok: true,
+        version: API_VERSION,
+        timestamp: new Date().toISOString(),
+        endpoints: STATUS_ENDPOINTS,
+      }), { headers: noCacheHeaders });
+    }
+
+    if (url.pathname === "/metrics") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const expectedToken = typeof env.ADMIN_TOKEN === "string" ? env.ADMIN_TOKEN.trim() : "";
+      if (!expectedToken) {
+        return new Response(JSON.stringify({ error: "metrics_unavailable" }), {
+          status: 503,
+          headers: noCacheHeaders,
+        });
+      }
+
+      const providedToken = request.headers.get("X-Admin-Token");
+      if (providedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "unauthorized" }), {
+          status: 401,
+          headers: noCacheHeaders,
+        });
+      }
+
+      const metrics = await loadMetrics(env);
+      return new Response(JSON.stringify({
+        uptime_ms: Math.max(0, Date.now() - startTime),
+        requests_total: metrics.requests_total,
+        kv_hits: metrics.kv_hits,
+        kv_misses: metrics.kv_misses,
+        timestamp: new Date().toISOString(),
+      }), { headers: noCacheHeaders });
     }
 
     if (url.pathname === "/status/uptime") {
@@ -1049,6 +1534,33 @@ export default {
         }),
         { headers: corsHeaders },
       );
+    }
+
+    if (url.pathname === "/fleet/health") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const cachedPayload = parseFleetHealthPayload(await env.CLANKA_STATE.get(FLEET_HEALTH_CACHE_KEY));
+      if (cachedPayload && isFleetHealthFresh(cachedPayload)) {
+        return new Response(JSON.stringify(cachedPayload), { headers: corsHeaders });
+      }
+
+      try {
+        const payload = await loadFleetHealthFromGithub(env);
+        return new Response(JSON.stringify(payload), { headers: corsHeaders });
+      } catch {
+        if (cachedPayload) {
+          return new Response(JSON.stringify(cachedPayload), { headers: corsHeaders });
+        }
+        return new Response(JSON.stringify({ error: "Service Unavailable" }), {
+          status: 503,
+          headers: corsHeaders,
+        });
+      }
     }
 
     if (url.pathname === "/pulse") {
@@ -1179,16 +1691,14 @@ export default {
         });
       }
 
-      const entries = await loadRegistryEntries(env);
-      const tools = entries.length > 0
-        ? registryEntriesToTools(entries)
-        : [];
+      const { entries, cached } = await loadToolsRegistryEntries(env);
 
       return new Response(
         JSON.stringify({
-          tools,
-          total: tools.length,
-          source: "registry",
+          tools: entries,
+          count: entries.length,
+          cached,
+          timestamp: new Date().toISOString(),
         }),
         { headers: corsHeaders },
       );
@@ -1290,8 +1800,20 @@ export default {
         });
       }
 
+      const token = typeof env.GITHUB_TOKEN === "string" ? env.GITHUB_TOKEN.trim() : "";
+      if (!token) {
+        return new Response(JSON.stringify({
+          commits: [],
+          error: "no token",
+          timestamp: new Date().toISOString(),
+        }), { headers: corsHeaders });
+      }
+
       const commits = await loadChangelog(env);
-      return new Response(JSON.stringify({ commits }), { headers: corsHeaders });
+      return new Response(JSON.stringify({
+        commits,
+        timestamp: new Date().toISOString(),
+      }), { headers: corsHeaders });
     }
 
     if (url.pathname === "/posts/count") {

@@ -12,6 +12,7 @@ const VALID_SET_PRESENCE_PAYLOAD = {
   team: { clanka: { status: "active", task: "ship tests" } },
   activity: { type: "SYNC", desc: "presence updated" },
 };
+const STATUS_ENDPOINTS = ["/", "/fleet/summary", "/fleet/health", "/history", "/now", "/status", "/metrics"];
 
 function createMockKV(store: Record<string, string> = {}): any {
   return {
@@ -20,13 +21,17 @@ function createMockKV(store: Record<string, string> = {}): any {
   };
 }
 
-function createEnv(extra: Record<string, string> = {}) {
+function createEnv(
+  extraKv: Record<string, string> = {},
+  extraEnv: Partial<{ ADMIN_KEY: string; ADMIN_TOKEN: string; GITHUB_TOKEN: string }> = {},
+) {
   return {
     CLANKA_STATE: createMockKV({
       "registry:v1": JSON.stringify(MOCK_REGISTRY),
-      ...extra,
+      ...extraKv,
     }),
     ADMIN_KEY: "test-secret",
+    ...extraEnv,
   };
 }
 
@@ -135,39 +140,83 @@ describe("GET /tools", () => {
     expect(res.headers.get("Content-Type")).toContain("application/json");
   });
 
-  it("response shape has tools array, total, source", async () => {
+  it("response shape has tools array, count, cached, timestamp", async () => {
     const res = await worker.fetch(req("/tools"), createEnv());
     const body = await json(res);
     expect(body).toEqual(
       expect.objectContaining({
         tools: expect.any(Array),
-        total: expect.any(Number),
-        source: "registry",
+        count: expect.any(Number),
+        cached: expect.any(Boolean),
+        timestamp: expect.any(String),
       }),
     );
-    expect(body).toHaveProperty("tools");
-    expect(body).toHaveProperty("total");
-    expect(body).toHaveProperty("source", "registry");
-    expect(body.tools).toBeInstanceOf(Array);
-    expect(body.total).toBe(body.tools.length);
+    expect(Number.isNaN(Date.parse(body.timestamp))).toBe(false);
   });
 
-  it("each tool has name, description, status", async () => {
+  it("count matches tools length", async () => {
+    const res = await worker.fetch(req("/tools"), createEnv());
+    const body = await json(res);
+    expect(body.count).toBe(body.tools.length);
+  });
+
+  it("each tool has repo, description, tier, criticality", async () => {
     const res = await worker.fetch(req("/tools"), createEnv());
     const body = await json(res);
     for (const t of body.tools) {
-      expect(t).toHaveProperty("name");
+      expect(t).toHaveProperty("repo");
       expect(t).toHaveProperty("description");
-      expect(t).toHaveProperty("status");
+      expect(t).toHaveProperty("tier");
+      expect(t).toHaveProperty("criticality");
     }
   });
 
   it("returns tools from mock registry", async () => {
     const res = await worker.fetch(req("/tools"), createEnv());
     const body = await json(res);
-    const names = body.tools.map((t: any) => t.name);
-    expect(names).toContain("clanka-api");
-    expect(names).toContain("ci-triage");
+    const repos = body.tools.map((t: any) => t.repo);
+    expect(repos).toContain("clankamode/clanka-api");
+    expect(repos).toContain("clankamode/ci-triage");
+  });
+
+  it("sets cached=true when served from KV", async () => {
+    const res = await worker.fetch(req("/tools"), createEnv());
+    const body = await json(res);
+    expect(body.cached).toBe(true);
+  });
+
+  it("supports registry payloads stored under an entries array shape", async () => {
+    const res = await worker.fetch(
+      req("/tools"),
+      createEnv({
+        "registry:v1": JSON.stringify({
+          entries: [
+            { repo: "clankamode/entries-tool", criticality: "medium", tier: "ops", description: "Entries tool" },
+          ],
+        }),
+      }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body.cached).toBe(true);
+    expect(body.count).toBe(1);
+    expect(body.tools[0].repo).toBe("clankamode/entries-tool");
+  });
+
+  it("deduplicates registry entries by repo name", async () => {
+    const res = await worker.fetch(
+      req("/tools"),
+      createEnv({
+        "registry:v1": JSON.stringify([
+          { repo: "clankamode/dup-tool", criticality: "high", tier: "ops", description: "A" },
+          { repo: "clankamode/dup-tool", criticality: "high", tier: "ops", description: "B" },
+        ]),
+      }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body.count).toBe(1);
+    expect(body.tools[0].repo).toBe("clankamode/dup-tool");
   });
 
   it("returns CORS headers", async () => {
@@ -175,21 +224,133 @@ describe("GET /tools", () => {
     expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
   });
 
-  it("returns empty tools array when registry cache is empty", async () => {
+  it("returns cached=false on KV miss and fetches from GitHub", async () => {
+    const liveRegistry = {
+      tools: [
+        { repo: "clankamode/live-tool", criticality: "high", tier: "ops", description: "Live tool" },
+      ],
+    };
+    const content = Buffer.from(JSON.stringify(liveRegistry), "utf8").toString("base64");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ content }), { status: 200 }));
+
+    const env = {
+      CLANKA_STATE: createMockKV({}),
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    const res = await worker.fetch(req("/tools"), env as any);
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.cached).toBe(false);
+    expect(body.count).toBe(1);
+    expect(body.tools[0].repo).toBe("clankamode/live-tool");
+  });
+
+  it("writes fetched registry to KV with 5-minute TTL", async () => {
+    const putCalls: Array<{ key: string; opts?: any }> = [];
+    const kvStore: Record<string, string> = {};
+    const env = {
+      CLANKA_STATE: {
+        get: async (key: string) => kvStore[key] ?? null,
+        put: async (key: string, value: string, opts?: any) => {
+          kvStore[key] = value;
+          putCalls.push({ key, opts });
+        },
+      },
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    const content = Buffer.from(JSON.stringify({
+      tools: [
+        { repo: "clankamode/live-tool", criticality: "high", tier: "ops", description: "Live tool" },
+      ],
+    }), "utf8").toString("base64");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ content }), { status: 200 }));
+
+    const res = await worker.fetch(req("/tools"), env as any);
+    expect(res.status).toBe(200);
+    expect(putCalls).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        key: "registry:v1",
+        opts: expect.objectContaining({ expirationTtl: 300 }),
+      }),
+    ]));
+  });
+
+  it("returns empty tools array when GitHub fails on KV miss", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+    const env = {
+      CLANKA_STATE: createMockKV({}),
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
     const res = await worker.fetch(
       req("/tools"),
-      createEnv({ "registry:v1": JSON.stringify([]) }),
+      env as any,
     );
     const body = await json(res);
+
     expect(res.status).toBe(200);
     expect(body.tools).toEqual([]);
-    expect(body.total).toBe(0);
-    expect(body.source).toBe("registry");
+    expect(body.count).toBe(0);
+    expect(body.cached).toBe(false);
   });
 
   it("rejects non-GET with 405", async () => {
     const res = await worker.fetch(req("/tools", "POST"), createEnv());
     expect(res.status).toBe(405);
+  });
+});
+
+describe("Malformed cache fallbacks", () => {
+  it("returns an empty tools payload when registry:v1 cache JSON is malformed", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+
+    const res = await worker.fetch(
+      req("/tools"),
+      createEnv({ "registry:v1": "{invalid-json" }, { GITHUB_TOKEN: "gh-token" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      tools: [],
+      count: 0,
+    }));
+  });
+
+  it("returns safe defaults when github:stats cache JSON is malformed", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+
+    const res = await worker.fetch(
+      req("/github/stats"),
+      createEnv({ "github:stats:v1": "{invalid-json" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      repoCount: 0,
+      totalStars: 0,
+      lastPushedAt: null,
+      lastPushedRepo: null,
+      cachedAt: expect.any(String),
+    }));
+    expect(Number.isNaN(Date.parse(body.cachedAt))).toBe(false);
+  });
+
+  it("returns { events: [] } when github:events:v1 cache JSON is malformed", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+
+    const res = await worker.fetch(
+      req("/github/events"),
+      createEnv({ "github:events:v1": "{invalid-json" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ events: [] });
   });
 });
 
@@ -276,34 +437,25 @@ describe("Registry alignment and fallback", () => {
     const body = await json(res);
 
     expect(res.status).toBe(200);
-    expect(body.tools.map((tool: any) => tool.name)).toEqual(["alpha-tool", "zeta-tool"]);
+    expect(body.tools.map((tool: any) => tool.repo)).toEqual(["clankamode/alpha-tool", "clankamode/zeta-tool"]);
+    expect(body.cached).toBe(false);
     expect(kvStore["registry:v1"]).toBeTruthy();
-    expect(kvStore["registry:v1:stale"]).toBeTruthy();
   });
 
-  it("falls back to stale KV registry cache when GitHub API fails", async () => {
+  it("returns empty payload when GitHub API fails and primary cache is invalid", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
 
-    const staleRegistry = [
-      { repo: "clankamode/stale-tool", criticality: "high", tier: "infra", description: "Stale tool" },
-    ];
     const res = await worker.fetch(
       req("/tools"),
       createEnv({
         "registry:v1": "{invalid-json",
-        "registry:v1:stale": JSON.stringify(staleRegistry),
       }),
     );
     const body = await json(res);
 
     expect(res.status).toBe(200);
-    expect(body.total).toBe(1);
-    expect(body.tools[0]).toEqual(expect.objectContaining({
-      name: "stale-tool",
-      tier: "infra",
-      criticality: "high",
-      description: "Stale tool",
-    }));
+    expect(body.count).toBe(0);
+    expect(body.tools).toEqual([]);
   });
 
   it("filters malformed registry entries before serving /tools", async () => {
@@ -321,8 +473,166 @@ describe("Registry alignment and fallback", () => {
     const body = await json(res);
 
     expect(res.status).toBe(200);
-    expect(body.total).toBe(1);
-    expect(body.tools[0].name).toBe("good-tool");
+    expect(body.count).toBe(1);
+    expect(body.tools[0].repo).toBe("clankamode/good-tool");
+  });
+});
+
+describe("GET /changelog", () => {
+  it("returns commits and timestamp with expected shape", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([
+      {
+        sha: "abc123",
+        commit: {
+          message: "feat: add pipeline",
+          author: { name: "clanka", date: "2026-03-01T00:00:00.000Z" },
+          committer: { date: "2026-03-01T00:00:00.000Z" },
+        },
+        author: { login: "clanka" },
+      },
+    ]), { status: 200 }));
+
+    const res = await worker.fetch(req("/changelog"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      commits: expect.any(Array),
+      timestamp: expect.any(String),
+    }));
+    expect(body.commits[0]).toEqual(expect.objectContaining({
+      sha: "abc123",
+      message: "feat: add pipeline",
+      author: "clanka",
+      date: "2026-03-01T00:00:00.000Z",
+    }));
+    expect(body.commits[0]).not.toHaveProperty("url");
+    expect(Number.isNaN(Date.parse(body.timestamp))).toBe(false);
+  });
+
+  it("uses GITHUB_TOKEN authorization header", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+    const res = await worker.fetch(req("/changelog"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    expect(res.status).toBe(200);
+    const [, init] = fetchSpy.mock.calls[0];
+    const headers = (init as RequestInit)?.headers as Record<string, string>;
+    expect(headers.Authorization).toBe("Bearer gh-token");
+  });
+
+  it("serves from KV cache when changelog cache key is populated", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+    const cachedCommits = [
+      {
+        sha: "cached123",
+        message: "cached commit",
+        author: "cache-bot",
+        date: "2026-03-01T00:00:00.000Z",
+      },
+    ];
+    const res = await worker.fetch(
+      req("/changelog"),
+      createEnv({
+        "changelog:meta-runner:v1": JSON.stringify(cachedCommits),
+      }, { GITHUB_TOKEN: "gh-token" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.commits).toEqual(cachedCommits);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("writes changelog to KV with 10-minute TTL after GitHub fetch", async () => {
+    const putCalls: Array<{ key: string; opts?: any }> = [];
+    const kvStore: Record<string, string> = {};
+    const env = {
+      CLANKA_STATE: {
+        get: async (key: string) => kvStore[key] ?? null,
+        put: async (key: string, value: string, opts?: any) => {
+          kvStore[key] = value;
+          putCalls.push({ key, opts });
+        },
+      },
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([
+      {
+        sha: "abc123",
+        commit: {
+          message: "feat: add pipeline",
+          author: { name: "clanka", date: "2026-03-01T00:00:00.000Z" },
+        },
+        author: { login: "clanka" },
+      },
+    ]), { status: 200 }));
+
+    const res = await worker.fetch(req("/changelog"), env as any);
+    expect(res.status).toBe(200);
+    expect(putCalls).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        key: "changelog:meta-runner:v1",
+        opts: expect.objectContaining({ expirationTtl: 600 }),
+      }),
+    ]));
+  });
+
+  it("returns empty array and no token error when GITHUB_TOKEN is missing", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+    const res = await worker.fetch(req("/changelog"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      commits: [],
+      error: "no token",
+      timestamp: expect.any(String),
+    }));
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns empty commits when GitHub request fails", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+    const res = await worker.fetch(req("/changelog"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body.commits).toEqual([]);
+    expect(body).not.toHaveProperty("error");
+    expect(body).toHaveProperty("timestamp");
+  });
+
+  it("limits changelog response to 10 commits", async () => {
+    const commits = Array.from({ length: 12 }, (_, index) => ({
+      sha: `sha-${index}`,
+      commit: {
+        message: `commit-${index}`,
+        author: { name: "clanka", date: "2026-03-01T00:00:00.000Z" },
+      },
+      author: { login: "clanka" },
+    }));
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify(commits), { status: 200 }));
+
+    const res = await worker.fetch(req("/changelog"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body.commits).toHaveLength(10);
+  });
+
+  it("fetches from GitHub when changelog cache is invalid JSON", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+    const res = await worker.fetch(
+      req("/changelog"),
+      createEnv({
+        "changelog:meta-runner:v1": "{invalid-json",
+      }, { GITHUB_TOKEN: "gh-token" }),
+    );
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/changelog", "POST"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    expect(res.status).toBe(405);
   });
 });
 
@@ -351,8 +661,691 @@ describe("GET /fleet/summary", () => {
     expect(body.byCriticality.critical).toEqual(["clankamode/alpha", "clankamode/beta"]);
   });
 
+  it("falls back to an empty repos list when registry cache JSON is malformed", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+
+    const res = await worker.fetch(
+      req("/fleet/summary"),
+      createEnv({ "registry:v1": "{invalid-json" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      generatedAt: expect.any(String),
+      totalRepos: 0,
+      repos: [],
+      source: "registry",
+    }));
+    expect(body.tiers).toEqual({
+      ops: [],
+      infra: [],
+      core: [],
+      quality: [],
+      policy: [],
+      template: [],
+    });
+    expect(body.byCriticality).toEqual({
+      critical: [],
+      high: [],
+      medium: [],
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a valid empty shape when registry cache is an empty array", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+
+    const res = await worker.fetch(
+      req("/fleet/summary"),
+      createEnv({ "registry:v1": JSON.stringify([]) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.totalRepos).toBe(0);
+    expect(body.repos).toEqual([]);
+    expect(body.tiers).toEqual({
+      ops: [],
+      infra: [],
+      core: [],
+      quality: [],
+      policy: [],
+      template: [],
+    });
+    expect(body.byCriticality).toEqual({
+      critical: [],
+      high: [],
+      medium: [],
+    });
+    expect(body.source).toBe("registry");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns source=registry and ISO generatedAt timestamp", async () => {
+    const res = await worker.fetch(req("/fleet/summary"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.source).toBe("registry");
+    expect(Number.isNaN(Date.parse(body.generatedAt))).toBe(false);
+  });
+
+  it("always includes all tier and criticality buckets", async () => {
+    const res = await worker.fetch(
+      req("/fleet/summary"),
+      createEnv({
+        "registry:v1": JSON.stringify([
+          { repo: "clankamode/only-core", criticality: "critical", tier: "core", description: "only" },
+        ]),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.tiers).toEqual({
+      ops: [],
+      infra: [],
+      core: ["clankamode/only-core"],
+      quality: [],
+      policy: [],
+      template: [],
+    });
+    expect(body.byCriticality).toEqual({
+      critical: ["clankamode/only-core"],
+      high: [],
+      medium: [],
+    });
+  });
+
+  it("filters malformed entries and deduplicates by repo", async () => {
+    const res = await worker.fetch(
+      req("/fleet/summary"),
+      createEnv({
+        "registry:v1": JSON.stringify([
+          { repo: "clankamode/good", criticality: "high", tier: "ops", description: "ok" },
+          { repo: "clankamode/good", criticality: "high", tier: "ops", description: "dup" },
+          { repo: "clankamode/bad-criticality", criticality: "low", tier: "ops", description: "bad" },
+          { repo: "", criticality: "high", tier: "ops", description: "bad" },
+        ]),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.totalRepos).toBe(1);
+    expect(body.repos).toEqual([
+      {
+        repo: "clankamode/good",
+        criticality: "high",
+        tier: "ops",
+      },
+    ]);
+  });
+
+  it("supports registry payloads wrapped in an entries array", async () => {
+    const res = await worker.fetch(
+      req("/fleet/summary"),
+      createEnv({
+        "registry:v1": JSON.stringify({
+          entries: [
+            { repo: "clankamode/entries-only", criticality: "medium", tier: "infra", description: "wrapped" },
+          ],
+        }),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.totalRepos).toBe(1);
+    expect(body.repos[0]).toEqual({
+      repo: "clankamode/entries-only",
+      criticality: "medium",
+      tier: "infra",
+    });
+  });
+
+  it("returns CORS headers", async () => {
+    const res = await worker.fetch(req("/fleet/summary"), createEnv());
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  });
+
   it("rejects non-GET with 405", async () => {
     const res = await worker.fetch(req("/fleet/summary", "POST"), createEnv());
+    expect(res.status).toBe(405);
+  });
+});
+
+describe("GET /fleet/health", () => {
+  it("returns GREEN when latest conclusion is success", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.includes("/repos/clankamode/clanka-api/actions/runs")) {
+        return new Response(JSON.stringify({
+          workflow_runs: [
+            {
+              conclusion: "success",
+              status: "completed",
+              updated_at: "2026-03-01T00:00:00.000Z",
+            },
+          ],
+        }), { status: 200 });
+      }
+      if (url.includes("/repos/clankamode/ci-triage/actions/runs")) {
+        return new Response(JSON.stringify({
+          workflow_runs: [
+            {
+              conclusion: "success",
+              status: "completed",
+              updated_at: "2026-03-01T00:02:00.000Z",
+            },
+          ],
+        }), { status: 200 });
+      }
+      return new Response("Not Found", { status: 404 });
+    });
+
+    const res = await worker.fetch(req("/fleet/health"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("GREEN");
+    expect(body.repos).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        repo: "clankamode/clanka-api",
+        conclusion: "success",
+      }),
+      expect.objectContaining({
+        repo: "clankamode/ci-triage",
+        conclusion: "success",
+      }),
+    ]));
+  });
+
+  it("returns RED when latest conclusion is failure", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.includes("/repos/clankamode/clanka-api/actions/runs")) {
+        return new Response(JSON.stringify({
+          workflow_runs: [
+            {
+              conclusion: "failure",
+              status: "completed",
+              updated_at: "2026-03-01T00:00:00.000Z",
+            },
+          ],
+        }), { status: 200 });
+      }
+      if (url.includes("/repos/clankamode/ci-triage/actions/runs")) {
+        return new Response(JSON.stringify({
+          workflow_runs: [
+            {
+              conclusion: "success",
+              status: "completed",
+              updated_at: "2026-03-01T00:02:00.000Z",
+            },
+          ],
+        }), { status: 200 });
+      }
+      return new Response("Not Found", { status: 404 });
+    });
+
+    const res = await worker.fetch(req("/fleet/health"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("RED");
+    expect(body.repos).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        repo: "clankamode/clanka-api",
+        conclusion: "failure",
+      }),
+    ]));
+  });
+
+  it("returns YELLOW when latest conclusion is null", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
+      workflow_runs: [
+        {
+          conclusion: null,
+          status: "in_progress",
+          updated_at: "2026-03-01T00:00:00.000Z",
+        },
+      ],
+    }), { status: 200 }));
+
+    const res = await worker.fetch(req("/fleet/health"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("YELLOW");
+    expect(body.repos).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        conclusion: "null",
+      }),
+    ]));
+  });
+
+  it("returns UNKNOWN when GITHUB_TOKEN is missing", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+
+    const res = await worker.fetch(req("/fleet/health"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("UNKNOWN");
+    expect(body.repos).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        repo: "clankamode/clanka-api",
+        conclusion: "unknown",
+      }),
+      expect.objectContaining({
+        repo: "clankamode/ci-triage",
+        conclusion: "unknown",
+      }),
+    ]));
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("uses token authorization header for GitHub Actions requests", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
+      workflow_runs: [
+        {
+          conclusion: "success",
+          status: "completed",
+          updated_at: "2026-03-01T00:00:00.000Z",
+        },
+      ],
+    }), { status: 200 }));
+
+    const res = await worker.fetch(req("/fleet/health"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    expect(res.status).toBe(200);
+
+    const [, init] = fetchSpy.mock.calls[0];
+    const headers = (init as RequestInit)?.headers as Record<string, string>;
+    expect(headers.Authorization).toBe("token gh-token");
+  });
+
+  it("caches per-repo CI runs with 10-minute TTL and reuses repo cache", async () => {
+    const kvStore: Record<string, string> = {
+      "registry:v1": JSON.stringify(MOCK_REGISTRY),
+    };
+    const putCalls: Array<{ key: string; opts?: any }> = [];
+    const env = {
+      CLANKA_STATE: {
+        get: async (key: string) => kvStore[key] ?? null,
+        put: async (key: string, value: string, opts?: any) => {
+          kvStore[key] = value;
+          putCalls.push({ key, opts });
+        },
+      },
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
+      workflow_runs: [
+        {
+          conclusion: "success",
+          status: "completed",
+          updated_at: "2026-03-01T00:00:00.000Z",
+          name: "CI",
+        },
+      ],
+    }), { status: 200 }));
+
+    const first = await worker.fetch(req("/fleet/health"), env as any);
+    expect(first.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    const ciWrites = putCalls.filter((call) => call.key.startsWith("ci:"));
+    expect(ciWrites).toHaveLength(2);
+    expect(ciWrites.map((call) => call.key).sort()).toEqual([
+      "ci:clankamode/ci-triage:v1",
+      "ci:clankamode/clanka-api:v1",
+    ]);
+    for (const call of ciWrites) {
+      expect(call.opts?.expirationTtl).toBe(600);
+    }
+
+    const freshFleet = JSON.parse(kvStore["fleet:health:v1"]);
+    kvStore["fleet:health:v1"] = JSON.stringify({
+      ...freshFleet,
+      checkedAt: "2000-01-01T00:00:00.000Z",
+    });
+
+    fetchSpy.mockClear();
+    const second = await worker.fetch(req("/fleet/health"), env as any);
+    expect(second.status).toBe(200);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns stale from KV when GitHub fails", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("GitHub unavailable"));
+    const stalePayload = {
+      status: "YELLOW",
+      repos: [
+        {
+          repo: "clankamode/clanka-api",
+          criticality: "critical",
+          lastRun: "2026-03-01T00:00:00.000Z",
+          conclusion: "failure",
+        },
+      ],
+      checkedAt: "2026-03-01T00:05:00.000Z",
+    };
+
+    const res = await worker.fetch(
+      req("/fleet/health"),
+      createEnv(
+        {
+          "fleet:health:v1": JSON.stringify(stalePayload),
+        },
+        { GITHUB_TOKEN: "gh-token" },
+      ),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(stalePayload);
+  });
+
+  it("returns 503 when both GitHub and KV fail", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("GitHub unavailable"));
+
+    const res = await worker.fetch(req("/fleet/health"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(503);
+    expect(body).toEqual({ error: "Service Unavailable" });
+  });
+
+  it("returns fresh cache without calling GitHub", async () => {
+    const now = new Date().toISOString();
+    const cachedPayload = {
+      status: "GREEN",
+      repos: [
+        {
+          repo: "clankamode/clanka-api",
+          criticality: "critical",
+          lastRun: "2026-03-01T00:00:00.000Z",
+          conclusion: "success",
+        },
+      ],
+      checkedAt: now,
+    };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+
+    const res = await worker.fetch(
+      req("/fleet/health"),
+      createEnv({
+        "fleet:health:v1": JSON.stringify(cachedPayload),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(cachedPayload);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/fleet/health", "POST"), createEnv());
+    expect(res.status).toBe(405);
+  });
+});
+
+describe("GET /history", () => {
+  it("uses the default limit and returns at most 20 entries", async () => {
+    const history = Array.from({ length: 30 }, (_, index) => ({
+      timestamp: 2_000_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(20);
+    expect(body.count).toBe(20);
+    expect(body.history[0]).toEqual(expect.objectContaining({ desc: "event-29" }));
+    expect(body.history[19]).toEqual(expect.objectContaining({ desc: "event-10" }));
+  });
+
+  it("applies explicit ?limit=5 and clamps output to 5 entries", async () => {
+    const history = Array.from({ length: 12 }, (_, index) => ({
+      timestamp: 1_000_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history?limit=5"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(5);
+    expect(body.count).toBe(5);
+    expect(body.history[0]).toEqual(expect.objectContaining({ desc: "event-11" }));
+    expect(body.history[4]).toEqual(expect.objectContaining({ desc: "event-7" }));
+  });
+
+  it("keeps count in sync with returned history length", async () => {
+    const history = Array.from({ length: 8 }, (_, index) => ({
+      timestamp: 900_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history?limit=3"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(3);
+    expect(body.count).toBe(body.history.length);
+  });
+
+  it("clamps ?limit above max to 20", async () => {
+    const history = Array.from({ length: 30 }, (_, index) => ({
+      timestamp: 1_000_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history?limit=100"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(20);
+    expect(body.count).toBe(20);
+  });
+
+  it("uses default limit when ?limit is not a number", async () => {
+    const history = Array.from({ length: 25 }, (_, index) => ({
+      timestamp: 1_000_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history?limit=abc"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(20);
+    expect(body.count).toBe(20);
+  });
+
+  it("uses default limit when ?limit is zero", async () => {
+    const history = Array.from({ length: 22 }, (_, index) => ({
+      timestamp: 1_000_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history?limit=0"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(20);
+    expect(body.count).toBe(20);
+  });
+
+  it("uses default limit when ?limit is negative", async () => {
+    const history = Array.from({ length: 22 }, (_, index) => ({
+      timestamp: 1_000_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history?limit=-5"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(20);
+    expect(body.count).toBe(20);
+  });
+
+  it("floors decimal limit values", async () => {
+    const history = Array.from({ length: 9 }, (_, index) => ({
+      timestamp: 1_000_000 + index,
+      desc: `event-${index}`,
+      type: "SYNC",
+      hash: `h${index}`,
+    }));
+
+    const res = await worker.fetch(
+      req("/history?limit=3.9"),
+      createEnv({ history: JSON.stringify(history) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history).toHaveLength(3);
+    expect(body.count).toBe(3);
+  });
+
+  it("returns reverse-chronological order (newest first)", async () => {
+    const res = await worker.fetch(
+      req("/history"),
+      createEnv({
+        history: JSON.stringify([
+          { timestamp: 1000, desc: "oldest", type: "SYNC", hash: "h1" },
+          { timestamp: 3000, desc: "newest", type: "SYNC", hash: "h3" },
+          { timestamp: 2000, desc: "middle", type: "SYNC", hash: "h2" },
+        ]),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history.map((entry: any) => entry.desc)).toEqual(["newest", "middle", "oldest"]);
+  });
+
+  it("returns empty history when cached history JSON is invalid", async () => {
+    const res = await worker.fetch(
+      req("/history"),
+      createEnv({ history: "{invalid-json" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ history: [], count: 0 });
+  });
+
+  it("returns empty history when cached history is not an array", async () => {
+    const res = await worker.fetch(
+      req("/history"),
+      createEnv({ history: JSON.stringify({ desc: "not-an-array" }) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ history: [], count: 0 });
+  });
+
+  it("normalizes malformed history entries to safe defaults", async () => {
+    const res = await worker.fetch(
+      req("/history"),
+      createEnv({
+        history: JSON.stringify([
+          null,
+          { message: "from-message" },
+          { type: "SYNC", desc: "explicit", hash: "abc12345", timestamp: 12345 },
+        ]),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.history[0]).toEqual(expect.objectContaining({
+      desc: "activity",
+      type: "event",
+      hash: expect.any(String),
+    }));
+    expect(body.history[1]).toEqual(expect.objectContaining({
+      desc: "from-message",
+      type: "event",
+    }));
+    expect(body.history[2]).toEqual(expect.objectContaining({
+      desc: "explicit",
+      type: "SYNC",
+      hash: "abc12345",
+      timestamp: 12345,
+    }));
+    expect(body.count).toBe(3);
+  });
+
+  it("returns { history: [], count: 0 } for explicitly empty history", async () => {
+    const res = await worker.fetch(
+      req("/history"),
+      createEnv({ history: JSON.stringify([]) }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ history: [], count: 0 });
+  });
+
+  it("returns empty history gracefully on KV miss", async () => {
+    const res = await worker.fetch(req("/history"), createEnv());
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ history: [], count: 0 });
+  });
+
+  it("returns CORS headers", async () => {
+    const res = await worker.fetch(req("/history"), createEnv());
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/history", "POST"), createEnv());
     expect(res.status).toBe(405);
   });
 });
@@ -483,42 +1476,49 @@ describe("GET /openapi.json", () => {
   });
 });
 
-describe("Status regression coverage", () => {
-  const thresholdMs = 10 * 60 * 1000;
-
-  it("GET /status returns offline when LAST_SEEN_KEY is missing", async () => {
+describe("GET /status", () => {
+  it("returns the public status contract shape", async () => {
     const res = await worker.fetch(req("/status"), createEnv());
     const body = await json(res);
     expect(res.status).toBe(200);
-    expect(body).toEqual({ status: "offline" });
+    expect(body).toEqual({
+      ok: true,
+      version: "1.0.0",
+      timestamp: expect.any(String),
+      endpoints: STATUS_ENDPOINTS,
+    });
+    expect(Number.isNaN(Date.parse(body.timestamp))).toBe(false);
   });
 
-  it("GET /status returns operational at the offline threshold boundary", async () => {
-    const now = 1_750_000_000_000;
-    vi.spyOn(Date, "now").mockReturnValue(now);
-    const res = await worker.fetch(
-      req("/status"),
-      createEnv({ last_seen: String(now - thresholdMs) }),
-    );
+  it("disables caching for status", async () => {
+    const res = await worker.fetch(req("/status"), createEnv());
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("returns CORS headers", async () => {
+    const res = await worker.fetch(req("/status"), createEnv());
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/status", "POST"), createEnv());
     const body = await json(res);
-    expect(res.status).toBe(200);
-    expect(body).toEqual(expect.objectContaining({ status: "operational" }));
-    expect(body.last_seen).toBe(new Date(now - thresholdMs).toISOString());
+    expect(res.status).toBe(405);
+    expect(body).toEqual({ error: "Method Not Allowed" });
   });
 
-  it("GET /status returns offline when LAST_SEEN_KEY is beyond threshold", async () => {
-    const now = 1_750_000_000_000;
-    vi.spyOn(Date, "now").mockReturnValue(now);
-    const res = await worker.fetch(
-      req("/status"),
-      createEnv({ last_seen: String(now - thresholdMs - 1) }),
-    );
+  it("includes /metrics and /status in endpoint list", async () => {
+    const res = await worker.fetch(req("/status"), createEnv());
     const body = await json(res);
-    expect(res.status).toBe(200);
-    expect(body).toEqual({ status: "offline" });
+    expect(body.endpoints).toContain("/status");
+    expect(body.endpoints).toContain("/metrics");
   });
+});
 
-  it("GET /status/uptime returns operational with uptime_ms when heartbeat is fresh", async () => {
+describe("GET /status/uptime regression coverage", () => {
+  const thresholdMs = 10 * 60 * 1000;
+
+  it("returns operational with uptime_ms when heartbeat is fresh", async () => {
     const now = 1_750_000_000_000;
     const lastSeen = now - 1234;
     vi.spyOn(Date, "now").mockReturnValue(now);
@@ -535,7 +1535,7 @@ describe("Status regression coverage", () => {
     }));
   });
 
-  it("GET /status/uptime returns offline when heartbeat is stale", async () => {
+  it("returns offline when heartbeat is stale", async () => {
     const now = 1_750_000_000_000;
     vi.spyOn(Date, "now").mockReturnValue(now);
     const res = await worker.fetch(
@@ -545,6 +1545,113 @@ describe("Status regression coverage", () => {
     const body = await json(res);
     expect(res.status).toBe(200);
     expect(body).toEqual({ status: "offline", uptime_ms: 0, last_seen: null });
+  });
+});
+
+describe("GET /metrics", () => {
+  it("returns 401 when token is missing", async () => {
+    const res = await worker.fetch(
+      req("/metrics"),
+      createEnv({}, { ADMIN_TOKEN: "metrics-secret" }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(401);
+    expect(body).toEqual({ error: "unauthorized" });
+  });
+
+  it("returns 401 when token is wrong", async () => {
+    const res = await worker.fetch(
+      req("/metrics", "GET", undefined, { "X-Admin-Token": "wrong-token" }),
+      createEnv({}, { ADMIN_TOKEN: "metrics-secret" }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(401);
+    expect(body).toEqual({ error: "unauthorized" });
+  });
+
+  it("returns 200 with metrics shape when token is correct", async () => {
+    const res = await worker.fetch(
+      req("/metrics", "GET", undefined, { "X-Admin-Token": "metrics-secret" }),
+      createEnv({}, { ADMIN_TOKEN: "metrics-secret" }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      uptime_ms: expect.any(Number),
+      requests_total: expect.any(Number),
+      kv_hits: expect.any(Number),
+      kv_misses: expect.any(Number),
+      timestamp: expect.any(String),
+    }));
+    expect(Number.isNaN(Date.parse(body.timestamp))).toBe(false);
+  });
+
+  it("returns 503 when ADMIN_TOKEN is missing", async () => {
+    const res = await worker.fetch(req("/metrics"), createEnv());
+    const body = await json(res);
+    expect(res.status).toBe(503);
+    expect(body).toEqual({ error: "metrics_unavailable" });
+  });
+
+  it("disables caching for authorized metrics responses", async () => {
+    const res = await worker.fetch(
+      req("/metrics", "GET", undefined, { "X-Admin-Token": "metrics-secret" }),
+      createEnv({}, { ADMIN_TOKEN: "metrics-secret" }),
+    );
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("disables caching for unauthorized metrics responses", async () => {
+    const res = await worker.fetch(
+      req("/metrics"),
+      createEnv({}, { ADMIN_TOKEN: "metrics-secret" }),
+    );
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(
+      req("/metrics", "POST"),
+      createEnv({}, { ADMIN_TOKEN: "metrics-secret" }),
+    );
+    const body = await json(res);
+    expect(res.status).toBe(405);
+    expect(body).toEqual({ error: "Method Not Allowed" });
+  });
+
+  it("returns non-negative numeric counters", async () => {
+    const res = await worker.fetch(
+      req("/metrics", "GET", undefined, { "X-Admin-Token": "metrics-secret" }),
+      createEnv({}, { ADMIN_TOKEN: "metrics-secret" }),
+    );
+    const body = await json(res);
+    expect(body.requests_total).toBeGreaterThanOrEqual(0);
+    expect(body.kv_hits).toBeGreaterThanOrEqual(0);
+    expect(body.kv_misses).toBeGreaterThanOrEqual(0);
+  });
+
+  it("falls back to in-memory counters when KV is unavailable", async () => {
+    const env = {
+      CLANKA_STATE: {
+        get: async () => { throw new Error("kv unavailable"); },
+        put: async () => { throw new Error("kv unavailable"); },
+      },
+      ADMIN_KEY: "test-secret",
+      ADMIN_TOKEN: "metrics-secret",
+    };
+    const res = await worker.fetch(
+      req("/metrics", "GET", undefined, { "X-Admin-Token": "metrics-secret" }),
+      env as any,
+    );
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      uptime_ms: expect.any(Number),
+      requests_total: expect.any(Number),
+      kv_hits: expect.any(Number),
+      kv_misses: expect.any(Number),
+      timestamp: expect.any(String),
+    }));
   });
 });
 
