@@ -25,6 +25,8 @@
 ## 🟡 Medium Priority
 - [x] Add contract tests for `/now` and `/pulse` in `src/index.test.ts` to assert exact response shape, required fields, and deterministic presence of `status`, `last_seen`, and `signal`. (completed 2026-03-01)
 - [x] Add fleet metadata tests for `/fleet/summary` to verify tier/criticality grouping, total repo count, and deterministic ordering. (completed 2026-03-01)
+- [x] Add `/fleet/health` endpoint with 5-minute KV cache and graceful GitHub failure fallback (stale cache or 503), plus endpoint tests for success/stale/503 paths. (completed 2026-03-01)
+- [x] Upgrade `/fleet/health` CI checks to poll GitHub Actions runs with per-repo KV cache (`ci:<repo>:v1`, 10m TTL), token-less fallback to `UNKNOWN`, and expanded endpoint tests. (completed 2026-03-01)
 - [ ] Add endpoint coverage for `/history` query behavior in `src/index.test.ts` (e.g., default limit, explicit limit clamping, and reverse-chronological ordering).
 - [ ] Add docs in `README.md` for admin APIs (`/set-presence`, `/heartbeat`, `/admin/activity`, `/admin/tasks`) with request/response examples and required `Bearer` token flow.
 
