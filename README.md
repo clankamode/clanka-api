@@ -33,3 +33,90 @@ npx wrangler deploy     # deploy to edge
 
 ## Part of
 [`clankamode`](https://github.com/clankamode) — autonomous tooling fleet
+
+## Admin API Reference
+
+All admin write endpoints require `Authorization: Bearer <ADMIN_KEY>` (Cloudflare Worker secret).
+
+### `POST /set-presence`
+
+Updates presence, team, and activity. All three fields are required.
+
+**Request:**
+```json
+{ "presence": "online", "team": "solo", "activity": "shipping" }
+```
+
+**Response `200`:**
+```json
+{ "success": true, "presence": "online", "team": "solo", "activity": "shipping" }
+```
+
+**Errors:** `400` if any required field is missing. `401` on auth failure.
+
+---
+
+### `POST /heartbeat`
+
+Ping to refresh `last_seen`. Optionally batch-inserts history entries.
+
+**Request (ping only):** `{}`
+
+**Request (with history):**
+```json
+{
+  "history": [
+    { "desc": "Deployed fleet-status-page", "type": "deploy" }
+  ]
+}
+```
+
+**Response `200`:**
+```json
+{ "success": true, "status": "operational", "last_seen": "2026-02-28T03:00:00.000Z" }
+```
+
+**Errors:** `400` if `history` is not an array or entries are not objects. `401` on auth failure.
+
+---
+
+### `POST /admin/activity`
+
+Appends a single entry to the history ring buffer (capped at 20).
+
+**Request:**
+```json
+{ "type": "deploy", "desc": "Pushed fleet-status-page v0.3.1" }
+```
+
+**Response `200`:**
+```json
+{ "success": true, "entry": { "desc": "...", "type": "deploy", "timestamp": 1709085600000 } }
+```
+
+**Errors:** `400` if `desc` or `type` are missing/empty. `401` on auth failure. `405` for non-POST.
+
+---
+
+### `GET|POST|PUT|DELETE /admin/tasks`
+
+KV-backed task CRUD (stored under `tasks` key in `CLANKA_STATE`).
+
+| Method | Body | Action |
+|--------|------|--------|
+| `GET` | — | Returns `[{ id, text, done }]` |
+| `POST` | `{ id, text, done }` | Appends task |
+| `PUT` | `{ id, ...fields }` | Updates task matching `id` |
+| `DELETE` | `{ id }` | Removes task matching `id` |
+
+All methods return `401` if `Authorization` header is absent or incorrect.
+
+---
+
+### `GET /metrics`
+
+Internal counters and diagnostics. Requires `X-Admin-Token: <ADMIN_KEY>` (not `Authorization`).
+
+**Response `200`:** `{ "ok": true, "version": "1.0.0", "requests": 142, "errors": 3 }`
+
+**Errors:** `401` if token is wrong. `503` if KV is unavailable.
