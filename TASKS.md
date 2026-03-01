@@ -32,6 +32,7 @@
 - [x] Add endpoint coverage for `/history` query behavior in `src/index.test.ts` (default limit, explicit `limit` clamping/parsing, reverse-chronological ordering, empty+KV miss behavior). (completed 2026-03-01)
 - [x] Add `/fleet/summary` regression coverage for malformed/empty `registry:v1` cache values to guarantee safe `200` responses and valid empty shape. (completed 2026-03-01)
 - [x] Add docs in `README.md` for admin APIs (`/set-presence`, `/heartbeat`, `/admin/activity`, `/admin/tasks`) with request/response examples and required `Bearer` token flow. (completed 2026-02-28)
+- [x] Add `GET /tools/:repo`, `GET /fleet/trend`, and `POST /admin/refresh` (`ADMIN_TOKEN` header) plus comprehensive vitest coverage, including cache invalidation behavior. (completed 2026-03-01, tests: 156)
 
 ## 🟢 Low Priority / Nice to Have
 - [x] Add a `README` endpoint matrix table for public/admin routes with auth, method, status code classes, and operational notes. (completed 2026-03-01)
