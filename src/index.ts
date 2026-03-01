@@ -22,6 +22,18 @@ type FleetHealthPayload = {
   repos: FleetRepoHealth[];
   checkedAt: string;
 };
+type FleetTrendDirection = "up" | "down" | "flat" | "unknown";
+type FleetRepoTrend = {
+  repo: string;
+  criticality: FleetCriticality;
+  last5: string[];
+  direction: FleetTrendDirection;
+};
+type FleetTrendPayload = {
+  generatedAt: string;
+  totalRepos: number;
+  repos: FleetRepoTrend[];
+};
 type HistoryEntry = { timestamp: number; desc: string; type: string; hash: string };
 
 type Project = { name: string; description: string; url: string; status: string; last_updated: string };
@@ -59,6 +71,15 @@ const FLEET_HEALTH_CACHE_KEY = "fleet:health:v1";
 const FLEET_HEALTH_TTL_SEC = 5 * 60; // 5 minutes
 const FLEET_HEALTH_TTL_MS = FLEET_HEALTH_TTL_SEC * 1000;
 const FLEET_CI_TTL_SEC = 10 * 60; // 10 minutes
+const GITHUB_EVENTS_CACHE_KEY = "github:events:v1";
+const CACHE_KEYS_TO_INVALIDATE = [
+  REGISTRY_CACHE_KEY,
+  REGISTRY_STALE_CACHE_KEY,
+  FLEET_HEALTH_CACHE_KEY,
+  GITHUB_STATS_CACHE_KEY,
+  CHANGELOG_CACHE_KEY,
+  GITHUB_EVENTS_CACHE_KEY,
+];
 
 const RATE_LIMIT_KEY_PREFIX = "rate_limit:ip:";
 const RATE_LIMIT_WINDOW_SEC = 60;
@@ -220,6 +241,52 @@ const OPENAPI_SPEC = {
         },
       },
     },
+    "/tools/{repo}": {
+      get: {
+        summary: "Get a registered tool by repo",
+        parameters: [
+          {
+            name: "repo",
+            in: "path",
+            required: true,
+            schema: { type: "string" },
+          },
+        ],
+        responses: {
+          "200": {
+            description: "Tool payload",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    tool: {
+                      type: "object",
+                      properties: {
+                        repo: { type: "string" },
+                        description: { type: "string" },
+                        tier: { type: "string" },
+                        criticality: { type: "string" },
+                      },
+                      required: ["repo", "description", "tier", "criticality"],
+                    },
+                    cached: { type: "boolean" },
+                    timestamp: { type: "string" },
+                  },
+                  required: ["tool", "cached", "timestamp"],
+                },
+              },
+            },
+          },
+          "404": {
+            description: "Tool not found",
+          },
+          "429": {
+            description: "Too Many Requests",
+          },
+        },
+      },
+    },
     "/tasks": {
       get: {
         summary: "Get parsed open tasks per repo",
@@ -293,6 +360,47 @@ const OPENAPI_SPEC = {
           },
           "503": {
             description: "GitHub unavailable and no cache available",
+          },
+          "429": {
+            description: "Too Many Requests",
+          },
+        },
+      },
+    },
+    "/fleet/trend": {
+      get: {
+        summary: "Get CI trend data across registered fleet repos",
+        responses: {
+          "200": {
+            description: "Fleet trend payload",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    generatedAt: { type: "string" },
+                    totalRepos: { type: "number" },
+                    repos: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          repo: { type: "string" },
+                          criticality: { type: "string" },
+                          last5: {
+                            type: "array",
+                            items: { type: "string" },
+                          },
+                          direction: { type: "string", enum: ["up", "down", "flat", "unknown"] },
+                        },
+                        required: ["repo", "criticality", "last5", "direction"],
+                      },
+                    },
+                  },
+                  required: ["generatedAt", "totalRepos", "repos"],
+                },
+              },
+            },
           },
           "429": {
             description: "Too Many Requests",
@@ -943,6 +1051,10 @@ function fleetCiCacheKey(repo: string): string {
   return `ci:${repo}:v1`;
 }
 
+function fleetCiTrendCacheKey(repo: string): string {
+  return `ci:trend:${repo}:v1`;
+}
+
 function parseWorkflowRun(run: unknown): GithubWorkflowRun | null {
   if (!run || typeof run !== "object" || Array.isArray(run)) return null;
 
@@ -977,6 +1089,105 @@ function parseWorkflowRun(run: unknown): GithubWorkflowRun | null {
 function parseWorkflowRunCache(raw: string | null): GithubWorkflowRun | null {
   if (!raw) return null;
   return parseWorkflowRun(safeParseJSON<unknown>(raw, null));
+}
+
+function parseConclusionsCache(raw: string | null): string[] | null {
+  if (raw === null) return null;
+  const parsed = safeParseJSON<unknown>(raw, null);
+  if (!Array.isArray(parsed)) return null;
+  const conclusions = parsed
+    .slice(0, 5)
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) => item.length > 0);
+  return conclusions;
+}
+
+function workflowRunToConclusion(run: GithubWorkflowRun): string {
+  if (run.conclusion === null) return "null";
+  if (typeof run.conclusion === "string" && run.conclusion.length > 0) {
+    return run.conclusion;
+  }
+  return "unknown";
+}
+
+function trendScore(conclusion: string): number {
+  const normalized = conclusion.trim().toLowerCase();
+  if (normalized === "success") return 2;
+  if (normalized === "neutral" || normalized === "skipped") return 1;
+  if (
+    normalized === "failure"
+    || normalized === "cancelled"
+    || normalized === "timed_out"
+    || normalized === "action_required"
+    || normalized === "startup_failure"
+    || normalized === "stale"
+  ) {
+    return 0;
+  }
+  return 1;
+}
+
+function average(values: number[]): number {
+  if (values.length === 0) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function deriveTrendDirection(conclusions: string[]): FleetTrendDirection {
+  if (conclusions.length === 0) return "unknown";
+  if (conclusions.length === 1) return "flat";
+
+  const scores = conclusions.map((conclusion) => trendScore(conclusion));
+  const newest = scores[0];
+  const oldest = scores[scores.length - 1];
+  if (newest > oldest) return "up";
+  if (newest < oldest) return "down";
+
+  const split = Math.ceil(scores.length / 2);
+  const recentAverage = average(scores.slice(0, split));
+  const olderAverage = average(scores.slice(split));
+  if (recentAverage > olderAverage) return "up";
+  if (recentAverage < olderAverage) return "down";
+  return "flat";
+}
+
+async function loadRecentWorkflowConclusions(env: Env, repo: string): Promise<string[]> {
+  const cacheKey = fleetCiTrendCacheKey(repo);
+  const cached = parseConclusionsCache(await env.CLANKA_STATE.get(cacheKey));
+  if (cached !== null) return cached;
+  if (!env.GITHUB_TOKEN) return [];
+
+  const headers: Record<string, string> = {
+    "User-Agent": "clanka-api/1.0",
+    "Accept": "application/vnd.github.v3+json",
+    "Authorization": `token ${env.GITHUB_TOKEN}`,
+  };
+  try {
+    const runListUrl = `https://api.github.com/repos/${repo}/actions/runs?per_page=5`;
+    const res = await fetch(runListUrl, { headers });
+    if (!res.ok) return [];
+
+    const body = await res.json() as { workflow_runs?: unknown };
+    if (!Array.isArray(body.workflow_runs) || body.workflow_runs.length === 0) {
+      await env.CLANKA_STATE.put(cacheKey, JSON.stringify([]), {
+        expirationTtl: FLEET_CI_TTL_SEC,
+      });
+      return [];
+    }
+
+    const conclusions = body.workflow_runs
+      .slice(0, 5)
+      .map((run) => parseWorkflowRun(run))
+      .filter((run): run is GithubWorkflowRun => Boolean(run))
+      .map((run) => workflowRunToConclusion(run));
+
+    await env.CLANKA_STATE.put(cacheKey, JSON.stringify(conclusions), {
+      expirationTtl: FLEET_CI_TTL_SEC,
+    });
+    return conclusions;
+  } catch {
+    return [];
+  }
 }
 
 async function loadLatestWorkflowRun(env: Env, repo: string): Promise<GithubWorkflowRun | null> {
@@ -1059,6 +1270,54 @@ async function loadFleetHealthFromGithub(env: Env): Promise<FleetHealthPayload> 
     expirationTtl: FLEET_HEALTH_TTL_SEC,
   });
   return payload;
+}
+
+async function loadFleetTrendFromGithub(env: Env): Promise<FleetTrendPayload> {
+  const registryEntries = await loadRegistryEntries(env);
+  const repos = await Promise.all(
+    registryEntries.map(async (entry) => {
+      const last5 = await loadRecentWorkflowConclusions(env, entry.repo);
+      return {
+        repo: entry.repo,
+        criticality: entry.criticality,
+        last5,
+        direction: deriveTrendDirection(last5),
+      } satisfies FleetRepoTrend;
+    }),
+  );
+  repos.sort((a, b) => a.repo.localeCompare(b.repo));
+
+  return {
+    generatedAt: new Date().toISOString(),
+    totalRepos: repos.length,
+    repos,
+  };
+}
+
+async function collectCacheKeysToInvalidate(env: Env): Promise<string[]> {
+  const keys = new Set<string>(CACHE_KEYS_TO_INVALIDATE);
+  const [primaryRaw, staleRaw] = await Promise.all([
+    env.CLANKA_STATE.get(REGISTRY_CACHE_KEY),
+    env.CLANKA_STATE.get(REGISTRY_STALE_CACHE_KEY),
+  ]);
+  const entries = [
+    ...(parseRegistryEntries(primaryRaw) ?? []),
+    ...(parseRegistryEntries(staleRaw) ?? []),
+  ];
+  for (const entry of entries) {
+    keys.add(fleetCiCacheKey(entry.repo));
+    keys.add(fleetCiTrendCacheKey(entry.repo));
+  }
+  return Array.from(keys).sort((a, b) => a.localeCompare(b));
+}
+
+async function invalidateCacheKey(env: Env, key: string): Promise<void> {
+  const kv = env.CLANKA_STATE as KVNamespace & { delete?: (key: string) => Promise<void> };
+  if (typeof kv.delete === "function") {
+    await kv.delete(key);
+    return;
+  }
+  await kv.put(key, "", { expirationTtl: 1 });
 }
 
 function registryEntriesToProjects(entries: RegistryEntry[]): Project[] {
@@ -1207,7 +1466,7 @@ export default {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Token",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Token, ADMIN_TOKEN",
     };
     const noCacheHeaders = {
       ...corsHeaders,
@@ -1458,6 +1717,40 @@ export default {
       }), { headers: noCacheHeaders });
     }
 
+    if (url.pathname === "/admin/refresh") {
+      if (request.method !== "POST") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: noCacheHeaders,
+        });
+      }
+
+      const expectedToken = typeof env.ADMIN_TOKEN === "string" ? env.ADMIN_TOKEN.trim() : "";
+      if (!expectedToken) {
+        return new Response(JSON.stringify({ error: "refresh_unavailable" }), {
+          status: 503,
+          headers: noCacheHeaders,
+        });
+      }
+
+      const providedToken = request.headers.get("ADMIN_TOKEN");
+      if (providedToken !== expectedToken) {
+        return new Response(JSON.stringify({ error: "unauthorized" }), {
+          status: 401,
+          headers: noCacheHeaders,
+        });
+      }
+
+      const keys = await collectCacheKeysToInvalidate(env);
+      await Promise.all(keys.map(async (key) => invalidateCacheKey(env, key)));
+      return new Response(JSON.stringify({
+        success: true,
+        invalidated: keys.length,
+        keys,
+        timestamp: new Date().toISOString(),
+      }), { headers: noCacheHeaders });
+    }
+
     if (url.pathname === "/status/uptime") {
       const lastSeenRaw = await env.CLANKA_STATE.get(LAST_SEEN_KEY);
       return new Response(JSON.stringify(getStatusUptimePayload(lastSeenRaw)), { headers: corsHeaders });
@@ -1702,6 +1995,51 @@ export default {
         }),
         { headers: corsHeaders },
       );
+    }
+
+    if (url.pathname.startsWith("/tools/")) {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      let rawRepo = "";
+      try {
+        rawRepo = decodeURIComponent(url.pathname.slice("/tools/".length)).trim();
+      } catch {
+        return new Response(JSON.stringify({ error: "Invalid repo path" }), {
+          status: 400,
+          headers: corsHeaders,
+        });
+      }
+      const { entries, cached } = await loadToolsRegistryEntries(env);
+      const match = entries.find((entry) => entry.repo.toLowerCase() === rawRepo.toLowerCase());
+      if (!match) {
+        return new Response(JSON.stringify({ error: "Tool Not Found" }), {
+          status: 404,
+          headers: corsHeaders,
+        });
+      }
+
+      return new Response(JSON.stringify({
+        tool: match,
+        cached,
+        timestamp: new Date().toISOString(),
+      }), { headers: corsHeaders });
+    }
+
+    if (url.pathname === "/fleet/trend") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
+      const payload = await loadFleetTrendFromGithub(env);
+      return new Response(JSON.stringify(payload), { headers: corsHeaders });
     }
 
     if (url.pathname === "/tasks") {

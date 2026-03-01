@@ -18,6 +18,7 @@ function createMockKV(store: Record<string, string> = {}): any {
   return {
     get: async (key: string) => store[key] ?? null,
     put: async (key: string, value: string, _opts?: any) => { store[key] = value; },
+    delete: async (key: string) => { delete store[key]; },
   };
 }
 
@@ -300,6 +301,83 @@ describe("GET /tools", () => {
   it("rejects non-GET with 405", async () => {
     const res = await worker.fetch(req("/tools", "POST"), createEnv());
     expect(res.status).toBe(405);
+  });
+});
+
+describe("GET /tools/:repo", () => {
+  it("returns 200 with matching tool for URL-encoded repo", async () => {
+    const res = await worker.fetch(req("/tools/clankamode%2Fclanka-api"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      tool: expect.objectContaining({
+        repo: "clankamode/clanka-api",
+        criticality: "critical",
+        tier: "core",
+      }),
+      cached: true,
+      timestamp: expect.any(String),
+    }));
+  });
+
+  it("returns 200 with matching tool for slash-delimited repo path", async () => {
+    const res = await worker.fetch(req("/tools/clankamode/clanka-api"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.tool.repo).toBe("clankamode/clanka-api");
+  });
+
+  it("matches repos case-insensitively", async () => {
+    const res = await worker.fetch(req("/tools/CLANKAMODE%2FCLANKA-API"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.tool.repo).toBe("clankamode/clanka-api");
+  });
+
+  it("returns 404 when repo is not found", async () => {
+    const res = await worker.fetch(req("/tools/clankamode%2Fmissing-repo"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(404);
+    expect(body).toEqual({ error: "Tool Not Found" });
+  });
+
+  it("returns 400 for invalid URL-encoding in repo path", async () => {
+    const res = await worker.fetch(req("/tools/%E0%A4%A"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(400);
+    expect(body).toEqual({ error: "Invalid repo path" });
+  });
+
+  it("returns 405 for non-GET methods", async () => {
+    const res = await worker.fetch(req("/tools/clankamode%2Fclanka-api", "POST"), createEnv());
+    expect(res.status).toBe(405);
+  });
+
+  it("returns cached=false when registry is fetched live on KV miss", async () => {
+    const liveRegistry = {
+      tools: [
+        { repo: "clankamode/live-tool", criticality: "high", tier: "ops", description: "Live tool" },
+      ],
+    };
+    const content = Buffer.from(JSON.stringify(liveRegistry), "utf8").toString("base64");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ content }), { status: 200 }));
+
+    const env = {
+      CLANKA_STATE: createMockKV({}),
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    const res = await worker.fetch(req("/tools/clankamode%2Flive-tool"), env as any);
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.cached).toBe(false);
+    expect(body.tool.repo).toBe("clankamode/live-tool");
   });
 });
 
@@ -1094,6 +1172,167 @@ describe("GET /fleet/health", () => {
   });
 });
 
+describe("GET /fleet/trend", () => {
+  it("returns last 5 conclusions per repo and computed direction", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.includes("/repos/clankamode/clanka-api/actions/runs")) {
+        return new Response(JSON.stringify({
+          workflow_runs: [
+            { conclusion: "failure", status: "completed" },
+            { conclusion: "failure", status: "completed" },
+            { conclusion: "success", status: "completed" },
+            { conclusion: "success", status: "completed" },
+            { conclusion: "success", status: "completed" },
+          ],
+        }), { status: 200 });
+      }
+      if (url.includes("/repos/clankamode/ci-triage/actions/runs")) {
+        return new Response(JSON.stringify({
+          workflow_runs: [
+            { conclusion: "success", status: "completed" },
+            { conclusion: "success", status: "completed" },
+            { conclusion: "failure", status: "completed" },
+            { conclusion: "failure", status: "completed" },
+            { conclusion: "failure", status: "completed" },
+          ],
+        }), { status: 200 });
+      }
+      return new Response("Not Found", { status: 404 });
+    });
+
+    const res = await worker.fetch(req("/fleet/trend"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      generatedAt: expect.any(String),
+      totalRepos: 2,
+      repos: expect.any(Array),
+    }));
+    const byRepo = Object.fromEntries(body.repos.map((repo: any) => [repo.repo, repo]));
+    expect(byRepo["clankamode/clanka-api"]).toEqual(expect.objectContaining({
+      last5: ["failure", "failure", "success", "success", "success"],
+      direction: "down",
+    }));
+    expect(byRepo["clankamode/ci-triage"]).toEqual(expect.objectContaining({
+      last5: ["success", "success", "failure", "failure", "failure"],
+      direction: "up",
+    }));
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns unknown direction with empty history when token is missing", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+
+    const res = await worker.fetch(req("/fleet/trend"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.totalRepos).toBe(2);
+    expect(body.repos).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        repo: "clankamode/clanka-api",
+        last5: [],
+        direction: "unknown",
+      }),
+      expect.objectContaining({
+        repo: "clankamode/ci-triage",
+        last5: [],
+        direction: "unknown",
+      }),
+    ]));
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("caches trend conclusions per repo with 10-minute TTL and reuses cache", async () => {
+    const kvStore: Record<string, string> = {
+      "registry:v1": JSON.stringify(MOCK_REGISTRY),
+    };
+    const putCalls: Array<{ key: string; opts?: any }> = [];
+    const env = {
+      CLANKA_STATE: {
+        get: async (key: string) => kvStore[key] ?? null,
+        put: async (key: string, value: string, opts?: any) => {
+          kvStore[key] = value;
+          putCalls.push({ key, opts });
+        },
+      },
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
+      workflow_runs: [
+        { conclusion: "success", status: "completed" },
+        { conclusion: "success", status: "completed" },
+      ],
+    }), { status: 200 }));
+
+    const first = await worker.fetch(req("/fleet/trend"), env as any);
+    expect(first.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(putCalls).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        key: "ci:trend:clankamode/clanka-api:v1",
+        opts: expect.objectContaining({ expirationTtl: 600 }),
+      }),
+      expect.objectContaining({
+        key: "ci:trend:clankamode/ci-triage:v1",
+        opts: expect.objectContaining({ expirationTtl: 600 }),
+      }),
+    ]));
+
+    fetchSpy.mockClear();
+    const second = await worker.fetch(req("/fleet/trend"), env as any);
+    expect(second.status).toBe(200);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns 200 with unknown trend when GitHub requests fail", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("GitHub unavailable"));
+
+    const res = await worker.fetch(req("/fleet/trend"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.repos).toEqual(expect.arrayContaining([
+      expect.objectContaining({ repo: "clankamode/clanka-api", last5: [], direction: "unknown" }),
+      expect.objectContaining({ repo: "clankamode/ci-triage", last5: [], direction: "unknown" }),
+    ]));
+  });
+
+  it("normalizes null conclusions and limits history to 5 runs", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      workflow_runs: [
+        { conclusion: null, status: "in_progress" },
+        { conclusion: null, status: "queued" },
+        { conclusion: "success", status: "completed" },
+        { conclusion: "success", status: "completed" },
+        { conclusion: "success", status: "completed" },
+        { conclusion: "failure", status: "completed" },
+      ],
+    }), { status: 200 }));
+
+    const res = await worker.fetch(req("/fleet/trend"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.repos[0].last5).toHaveLength(5);
+    expect(body.repos[0].last5[0]).toBe("null");
+  });
+
+  it("returns CORS headers", async () => {
+    const res = await worker.fetch(req("/fleet/trend"), createEnv());
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/fleet/trend", "POST"), createEnv());
+    expect(res.status).toBe(405);
+  });
+});
+
 describe("GET /history", () => {
   it("uses the default limit and returns at most 20 entries", async () => {
     const history = Array.from({ length: 30 }, (_, index) => ({
@@ -1469,7 +1708,9 @@ describe("GET /openapi.json", () => {
         "/health",
         "/projects",
         "/tools",
+        "/tools/{repo}",
         "/tasks",
+        "/fleet/trend",
         "/changelog",
       ]),
     );
@@ -1652,6 +1893,159 @@ describe("GET /metrics", () => {
       kv_misses: expect.any(Number),
       timestamp: expect.any(String),
     }));
+  });
+});
+
+describe("POST /admin/refresh", () => {
+  it("returns 405 for non-POST methods", async () => {
+    const res = await worker.fetch(
+      req("/admin/refresh"),
+      createEnv({}, { ADMIN_TOKEN: "refresh-secret" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(405);
+    expect(body).toEqual({ error: "Method Not Allowed" });
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("returns 503 when ADMIN_TOKEN is not configured", async () => {
+    const res = await worker.fetch(req("/admin/refresh", "POST"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(503);
+    expect(body).toEqual({ error: "refresh_unavailable" });
+  });
+
+  it("returns 401 when ADMIN_TOKEN header is missing", async () => {
+    const res = await worker.fetch(
+      req("/admin/refresh", "POST"),
+      createEnv({}, { ADMIN_TOKEN: "refresh-secret" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(401);
+    expect(body).toEqual({ error: "unauthorized" });
+  });
+
+  it("returns 401 when ADMIN_TOKEN header is incorrect", async () => {
+    const res = await worker.fetch(
+      req("/admin/refresh", "POST", undefined, { ADMIN_TOKEN: "wrong-token" }),
+      createEnv({}, { ADMIN_TOKEN: "refresh-secret" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(401);
+    expect(body).toEqual({ error: "unauthorized" });
+  });
+
+  it("sets no-store cache headers for unauthorized refresh requests", async () => {
+    const res = await worker.fetch(
+      req("/admin/refresh", "POST"),
+      createEnv({}, { ADMIN_TOKEN: "refresh-secret" }),
+    );
+
+    expect(res.status).toBe(401);
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("invalidates static and per-repo cache keys using KV.delete when available", async () => {
+    const kvStore: Record<string, string> = {
+      "registry:v1": JSON.stringify(MOCK_REGISTRY),
+      "registry:v1:stale": JSON.stringify([
+        { repo: "clankamode/stale-repo", criticality: "medium", tier: "ops", description: "stale" },
+      ]),
+      "fleet:health:v1": JSON.stringify({ status: "GREEN" }),
+      "github:stats:v1": JSON.stringify({ repoCount: 2 }),
+      "changelog:meta-runner:v1": JSON.stringify([]),
+      "github:events:v1": JSON.stringify([]),
+      "ci:clankamode/clanka-api:v1": JSON.stringify({ conclusion: "success" }),
+      "ci:trend:clankamode/clanka-api:v1": JSON.stringify(["success"]),
+      "ci:clankamode/ci-triage:v1": JSON.stringify({ conclusion: "failure" }),
+      "ci:trend:clankamode/ci-triage:v1": JSON.stringify(["failure"]),
+      "ci:clankamode/stale-repo:v1": JSON.stringify({ conclusion: "success" }),
+      "ci:trend:clankamode/stale-repo:v1": JSON.stringify(["success"]),
+    };
+    const deleteCalls: string[] = [];
+    const env = {
+      CLANKA_STATE: {
+        get: async (key: string) => kvStore[key] ?? null,
+        put: async (key: string, value: string) => { kvStore[key] = value; },
+        delete: async (key: string) => {
+          deleteCalls.push(key);
+          delete kvStore[key];
+        },
+      },
+      ADMIN_KEY: "test-secret",
+      ADMIN_TOKEN: "refresh-secret",
+    };
+
+    const res = await worker.fetch(
+      req("/admin/refresh", "POST", undefined, { ADMIN_TOKEN: "refresh-secret" }),
+      env as any,
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      success: true,
+      invalidated: expect.any(Number),
+      keys: expect.any(Array),
+      timestamp: expect.any(String),
+    }));
+    expect(deleteCalls).toEqual(expect.arrayContaining([
+      "registry:v1",
+      "registry:v1:stale",
+      "fleet:health:v1",
+      "github:stats:v1",
+      "changelog:meta-runner:v1",
+      "github:events:v1",
+      "ci:clankamode/clanka-api:v1",
+      "ci:trend:clankamode/clanka-api:v1",
+      "ci:clankamode/ci-triage:v1",
+      "ci:trend:clankamode/ci-triage:v1",
+      "ci:clankamode/stale-repo:v1",
+      "ci:trend:clankamode/stale-repo:v1",
+    ]));
+    expect(kvStore["registry:v1"]).toBeUndefined();
+    expect(kvStore["ci:trend:clankamode/clanka-api:v1"]).toBeUndefined();
+    expect(Number.isNaN(Date.parse(body.timestamp))).toBe(false);
+  });
+
+  it("falls back to expiring keys via KV.put when KV.delete is unavailable", async () => {
+    const kvStore: Record<string, string> = {
+      "registry:v1": JSON.stringify(MOCK_REGISTRY),
+      "fleet:health:v1": JSON.stringify({ status: "GREEN" }),
+    };
+    const putCalls: Array<{ key: string; opts?: any }> = [];
+    const env = {
+      CLANKA_STATE: {
+        get: async (key: string) => kvStore[key] ?? null,
+        put: async (key: string, value: string, opts?: any) => {
+          kvStore[key] = value;
+          putCalls.push({ key, opts });
+        },
+      },
+      ADMIN_KEY: "test-secret",
+      ADMIN_TOKEN: "refresh-secret",
+    };
+
+    const res = await worker.fetch(
+      req("/admin/refresh", "POST", undefined, { ADMIN_TOKEN: "refresh-secret" }),
+      env as any,
+    );
+
+    expect(res.status).toBe(200);
+    expect(putCalls).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        key: "registry:v1",
+        opts: expect.objectContaining({ expirationTtl: 1 }),
+      }),
+      expect.objectContaining({
+        key: "fleet:health:v1",
+        opts: expect.objectContaining({ expirationTtl: 1 }),
+      }),
+    ]));
   });
 });
 
