@@ -1,0 +1,37 @@
+#!/bin/sh
+
+set -eu
+
+echo "Running pre-push checks..."
+
+TEST_COVERAGE_SCRIPT="$(npm pkg get 'scripts[\"test:coverage:ci\"]')"
+TEST_SCRIPT="$(npm pkg get scripts.test)"
+LINT_SCRIPT="$(npm pkg get scripts.lint)"
+
+if [ "$TEST_COVERAGE_SCRIPT" != "{}" ]; then
+  TEST_CMD="npm run test:coverage:ci"
+elif [ "$TEST_SCRIPT" != "{}" ]; then
+  TEST_CMD="npm test"
+else
+  echo "No test command found (checked test:coverage:ci, test). Skipping tests."
+  TEST_CMD=""
+fi
+
+if [ -n "$TEST_CMD" ]; then
+  echo "Executing test command: $TEST_CMD"
+  if ! sh -c "$TEST_CMD"; then
+    echo "pre-push failed: tests did not pass." >&2
+    exit 1
+  fi
+fi
+
+if [ "$LINT_SCRIPT" != "{}" ]; then
+  echo "Executing lint command: npm run lint"
+  if ! npm run lint; then
+    echo "pre-push failed: lint did not pass." >&2
+    exit 1
+  fi
+fi
+
+echo "pre-push checks passed."
+exit 0
