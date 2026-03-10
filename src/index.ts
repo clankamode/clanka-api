@@ -848,6 +848,18 @@ function extractRegistryEntries(payload: unknown): RegistryEntry[] {
   return normalized;
 }
 
+function searchRegistryTools(entries: RegistryEntry[], query: string): RegistryEntry[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return [];
+
+  return entries.filter((entry) => {
+    return entry.repo.toLowerCase().includes(needle)
+      || entry.description.toLowerCase().includes(needle)
+      || entry.tier.toLowerCase().includes(needle)
+      || entry.criticality.toLowerCase().includes(needle);
+  });
+}
+
 function parseRegistryEntries(raw: string | null): RegistryEntry[] | null {
   if (raw === null) return null;
   try {

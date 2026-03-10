@@ -340,6 +340,30 @@ describe("GET /tools/:repo", () => {
     expect(body.tool.repo).toBe("clankamode/clanka-api");
   });
 
+  it("returns repo-context when it is present in registry data", async () => {
+    const env = createEnv({
+      "registry:v1": JSON.stringify([
+        ...MOCK_REGISTRY,
+        {
+          repo: "clankamode/repo-context",
+          criticality: "medium",
+          tier: "quality",
+          description: "Generates REPO.md and REPO.json context snapshots for any Git repo",
+        },
+      ]),
+    });
+    const res = await worker.fetch(req("/tools/clankamode%2Frepo-context"), env);
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.tool).toEqual(expect.objectContaining({
+      repo: "clankamode/repo-context",
+      criticality: "medium",
+      tier: "quality",
+      description: "Generates REPO.md and REPO.json context snapshots for any Git repo",
+    }));
+  });
+
   it("matches repos case-insensitively", async () => {
     const res = await worker.fetch(req("/tools/CLANKAMODE%2FCLANKA-API"), createEnv());
     const body = await json(res);
