@@ -34,6 +34,15 @@ type FleetTrendPayload = {
   totalRepos: number;
   repos: FleetRepoTrend[];
 };
+type FleetScorePayload = {
+  score: number;
+  status: FleetHealthStatus;
+  totalRepos: number;
+  healthyRepos: number;
+  degradedRepos: number;
+  unknownRepos: number;
+  timestamp: string;
+};
 type HistoryEntry = { timestamp: number; desc: string; type: string; hash: string };
 
 type Project = { name: string; description: string; url: string; status: string; last_updated: string };
@@ -921,6 +930,36 @@ async function loadToolsRegistryEntries(env: Env): Promise<{ entries: RegistryEn
   }
 }
 
+function searchRegistryTools(entries: RegistryEntry[], query: string): RegistryEntry[] {
+  const terms = query
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((term) => term.length > 0);
+  if (terms.length === 0) return [];
+
+  const normalizedQuery = terms.join(" ");
+  return entries
+    .map((entry) => {
+      const repo = entry.repo.toLowerCase();
+      const description = entry.description.toLowerCase();
+      const haystack = `${repo} ${description} ${entry.tier} ${entry.criticality}`;
+      const matches = terms.every((term) => haystack.includes(term));
+      if (!matches) return null;
+
+      let score = 0;
+      if (repo === normalizedQuery) score += 100;
+      if (repo.includes(normalizedQuery)) score += 20;
+      if (description.includes(normalizedQuery)) score += 10;
+      if (terms.every((term) => repo.includes(term))) score += 5;
+
+      return { entry, score };
+    })
+    .filter((item): item is { entry: RegistryEntry; score: number } => Boolean(item))
+    .sort((a, b) => b.score - a.score || a.entry.repo.localeCompare(b.entry.repo))
+    .map((item) => item.entry);
+}
+
 function parseOpenTasksMarkdown(markdown: string): RepoTask[] {
   const lines = markdown.split(/\r?\n/);
   const tasks: RepoTask[] = [];
@@ -1311,6 +1350,49 @@ async function loadFleetTrendFromGithub(env: Env): Promise<FleetTrendPayload> {
   };
 }
 
+function fleetScoreValue(status: FleetHealthStatus): number {
+  if (status === "GREEN") return 100;
+  if (status === "YELLOW") return 60;
+  if (status === "RED") return 20;
+  return 40;
+}
+
+async function loadFleetScorePayload(env: Env): Promise<FleetScorePayload> {
+  let health = parseFleetHealthPayload(await env.CLANKA_STATE.get(FLEET_HEALTH_CACHE_KEY));
+
+  if (!health || !isFleetHealthFresh(health)) {
+    try {
+      health = await loadFleetHealthFromGithub(env);
+    } catch {
+      if (!health) {
+        health = {
+          status: "UNKNOWN",
+          repos: [],
+          checkedAt: new Date().toISOString(),
+        };
+      }
+    }
+  }
+
+  const statuses = health.repos.map((repo) => deriveRepoHealthStatus(repo));
+  const healthyRepos = statuses.filter((status) => status === "GREEN").length;
+  const unknownRepos = statuses.filter((status) => status === "UNKNOWN").length;
+  const degradedRepos = statuses.length - healthyRepos - unknownRepos;
+  const score = statuses.length === 0
+    ? 0
+    : Math.round(statuses.reduce((sum, status) => sum + fleetScoreValue(status), 0) / statuses.length);
+
+  return {
+    score,
+    status: health.status,
+    totalRepos: health.repos.length,
+    healthyRepos,
+    degradedRepos,
+    unknownRepos,
+    timestamp: new Date().toISOString(),
+  };
+}
+
 async function collectCacheKeysToInvalidate(env: Env): Promise<string[]> {
   const keys = new Set<string>(CACHE_KEYS_TO_INVALIDATE);
   const [primaryRaw, staleRaw] = await Promise.all([
@@ -1371,43 +1453,57 @@ async function loadGithubStats(env: Env): Promise<GithubStatsPayload> {
     "Accept": "application/vnd.github.v3+json",
   };
 
-  const [userRes, reposRes] = await Promise.all([
-    fetch("https://api.github.com/users/clankamode", { headers: ghHeaders }),
-    fetch("https://api.github.com/users/clankamode/repos?per_page=100&type=owner", { headers: ghHeaders }),
-  ]);
+  try {
+    const [userRes, reposRes] = await Promise.all([
+      fetch("https://api.github.com/users/clankamode", { headers: ghHeaders }),
+      fetch("https://api.github.com/users/clankamode/repos?per_page=100&type=owner", { headers: ghHeaders }),
+    ]);
 
-  type GhRepo = { stargazers_count: number; pushed_at: string; name: string };
-  const repos: GhRepo[] = reposRes.ok ? (await reposRes.json() as GhRepo[]) : [];
+    type GhRepo = { stargazers_count: number; pushed_at: string; name: string };
+    const repos: GhRepo[] = reposRes.ok ? (await reposRes.json() as GhRepo[]) : [];
 
-  let repoCount = 0;
-  if (userRes.ok) {
-    const user = await userRes.json() as { public_repos?: number };
-    repoCount = user.public_repos ?? repos.length;
-  } else {
-    repoCount = repos.length;
-  }
-
-  const totalStars = repos.reduce((sum, r) => sum + (r.stargazers_count ?? 0), 0);
-
-  let lastPushedAt: string | null = null;
-  let lastPushedRepo: string | null = null;
-  for (const r of repos) {
-    if (!lastPushedAt || r.pushed_at > lastPushedAt) {
-      lastPushedAt = r.pushed_at;
-      lastPushedRepo = r.name;
+    let repoCount = 0;
+    if (userRes.ok) {
+      const user = await userRes.json() as { public_repos?: number };
+      repoCount = user.public_repos ?? repos.length;
+    } else {
+      repoCount = repos.length;
     }
+
+    const totalStars = repos.reduce((sum, r) => sum + (r.stargazers_count ?? 0), 0);
+
+    let lastPushedAt: string | null = null;
+    let lastPushedRepo: string | null = null;
+    for (const r of repos) {
+      if (!lastPushedAt || r.pushed_at > lastPushedAt) {
+        lastPushedAt = r.pushed_at;
+        lastPushedRepo = r.name;
+      }
+    }
+
+    const payload: GithubStatsPayload = {
+      repoCount,
+      totalStars,
+      lastPushedAt,
+      lastPushedRepo,
+      cachedAt: new Date().toISOString(),
+    };
+
+    try {
+      await env.CLANKA_STATE.put(GITHUB_STATS_CACHE_KEY, JSON.stringify(payload), { expirationTtl: GITHUB_STATS_TTL_SEC });
+    } catch {
+      // ignore cache write failures and still serve fresh data
+    }
+    return payload;
+  } catch {
+    return {
+      repoCount: 0,
+      totalStars: 0,
+      lastPushedAt: null,
+      lastPushedRepo: null,
+      cachedAt: new Date().toISOString(),
+    };
   }
-
-  const payload: GithubStatsPayload = {
-    repoCount,
-    totalStars,
-    lastPushedAt,
-    lastPushedRepo,
-    cachedAt: new Date().toISOString(),
-  };
-
-  await env.CLANKA_STATE.put(GITHUB_STATS_CACHE_KEY, JSON.stringify(payload), { expirationTtl: GITHUB_STATS_TTL_SEC });
-  return payload;
 }
 
 // Fleet registry is now derived from the live registry — kept for any legacy references
@@ -1769,11 +1865,25 @@ export default {
     }
 
     if (url.pathname === "/status/uptime") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
       const lastSeenRaw = await env.CLANKA_STATE.get(LAST_SEEN_KEY);
       return new Response(JSON.stringify(getStatusUptimePayload(lastSeenRaw)), { headers: corsHeaders });
     }
 
     if (url.pathname === "/health") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+          status: 405,
+          headers: corsHeaders,
+        });
+      }
+
       const lastSeenRaw = await env.CLANKA_STATE.get(LAST_SEEN_KEY);
       return new Response(JSON.stringify(getStatusPayload(lastSeenRaw)), { headers: corsHeaders });
     }
@@ -1922,13 +2032,14 @@ export default {
 
       if (request.method === 'GET') {
         const tasksRaw = await env.CLANKA_STATE.get("tasks") || "[]";
-        return new Response(tasksRaw, { headers: corsHeaders });
+        const tasks = safeParseJSON<unknown[]>(tasksRaw, []);
+        return new Response(JSON.stringify(tasks), { headers: corsHeaders });
       }
 
       if (request.method === 'POST') {
         const body = await request.json();
         const tasksRaw = await env.CLANKA_STATE.get("tasks") || "[]";
-        const tasks = JSON.parse(tasksRaw);
+        const tasks = safeParseJSON<unknown[]>(tasksRaw, []);
         tasks.push(body);
         await env.CLANKA_STATE.put("tasks", JSON.stringify(tasks));
         return new Response(JSON.stringify({ success: true }), { headers: corsHeaders });
@@ -1937,21 +2048,34 @@ export default {
       if (request.method === 'PUT') {
         const body = await request.json();
         const tasksRaw = await env.CLANKA_STATE.get("tasks") || "[]";
-        let tasks = JSON.parse(tasksRaw);
-        tasks = tasks.map((t: any) => t.id === body.id ? { ...t, ...body } : t);
-        await env.CLANKA_STATE.put("tasks", JSON.stringify(tasks));
+        const tasks = safeParseJSON<unknown[]>(tasksRaw, []);
+        const nextTasks = tasks.map((task) => {
+          if (!task || typeof task !== "object" || Array.isArray(task)) return task;
+          const item = task as { id?: unknown };
+          return item.id === (body as { id?: unknown }).id
+            ? { ...task, ...body as Record<string, unknown> }
+            : task;
+        });
+        await env.CLANKA_STATE.put("tasks", JSON.stringify(nextTasks));
         return new Response(JSON.stringify({ success: true }), { headers: corsHeaders });
       }
 
       if (request.method === 'DELETE') {
-        const body = await request.json() as any;
-        const id = body.id;
+        const body = await request.json() as { id?: unknown };
         const tasksRaw = await env.CLANKA_STATE.get("tasks") || "[]";
-        let tasks = JSON.parse(tasksRaw);
-        tasks = tasks.filter((t: any) => t.id !== id);
-        await env.CLANKA_STATE.put("tasks", JSON.stringify(tasks));
+        const tasks = safeParseJSON<unknown[]>(tasksRaw, []);
+        const nextTasks = tasks.filter((task) => {
+          if (!task || typeof task !== "object" || Array.isArray(task)) return true;
+          return (task as { id?: unknown }).id !== body.id;
+        });
+        await env.CLANKA_STATE.put("tasks", JSON.stringify(nextTasks));
         return new Response(JSON.stringify({ success: true }), { headers: corsHeaders });
       }
+
+      return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        status: 405,
+        headers: corsHeaders,
+      });
     }
 
     if (url.pathname === "/admin/activity") {
