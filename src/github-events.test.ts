@@ -61,6 +61,41 @@ describe("loadGithubEvents", () => {
     expect(events).toEqual([]);
   });
 
+  it("returns [] when the GitHub request throws", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network down"));
+
+    const events = await loadGithubEvents(createMockKV());
+
+    expect(events).toEqual([]);
+  });
+
+  it("returns fetched events even when writing the cache fails", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([
+      {
+        type: "PushEvent",
+        repo: { name: "clankamode/clanka-api" },
+        created_at: "2026-03-01T00:00:00.000Z",
+        payload: { commits: [{ message: "fresh message" }] },
+      },
+    ]), { status: 200 }));
+
+    const kv = {
+      get: async () => null,
+      put: async () => { throw new Error("kv unavailable"); },
+    } as KVNamespace;
+
+    const events = await loadGithubEvents(kv);
+
+    expect(events).toEqual([
+      {
+        type: "PUSH",
+        repo: "clanka-api",
+        message: "fresh message",
+        timestamp: "2026-03-01T00:00:00.000Z",
+      },
+    ]);
+  });
+
   it("normalizes repo names by removing clankamode/ prefix", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([
       {

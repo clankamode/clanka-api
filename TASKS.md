@@ -1,5 +1,5 @@
 # TASKS.md — clanka-api
-> Last updated: 2026-03-01 | Status: open
+> Last updated: 2026-03-12 | Status: open
 
 ## 🔴 High Priority
 - [x] **Deploy to Cloudflare** — live at https://clanka-api.clankamode.workers.dev (deployed 2026-02-26)
@@ -38,6 +38,7 @@
 - [x] Add a `README` endpoint matrix table for public/admin routes with auth, method, status code classes, and operational notes. (completed 2026-03-01)
 - [x] Add `src/index.test.ts` coverage for malformed/empty GitHub registry cache values in `src/index.ts` fallback paths (`registry:v1`, `GITHUB_STATS_CACHE_KEY`, `github:events:v1`) to avoid 500s and return safe defaults. (completed 2026-03-01)
 - [x] Add utility parsing tests for `src/github-events.ts` to lock `repo` normalization and event message truncation (Push/PR/Issue/Create). (completed 2026-03-01)
+- [x] Add a test coverage sweep for `/tools/search`, `/health`, `/status/uptime`, `/github/stats`, `/github/events`, `/fleet/score`, `/admin/tasks`, and `/posts/count`, and fix the missing route helpers/fallbacks those tests exposed. (completed 2026-03-12, tests: 189)
 
 ## 🧠 Notes
 - Stack: Cloudflare Workers + KV (`CLANKA_STATE`), TypeScript, Wrangler

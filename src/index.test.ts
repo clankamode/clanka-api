@@ -392,6 +392,62 @@ describe("GET /tools/:repo", () => {
   });
 });
 
+describe("GET /tools/search", () => {
+  it("returns exact repo matches with query metadata", async () => {
+    const res = await worker.fetch(
+      req("/tools/search?q=clankamode%2Fclanka-api"),
+      createEnv({
+        "registry:v1": JSON.stringify([
+          { repo: "clankamode/clanka-api", criticality: "critical", tier: "core", description: "Main API" },
+          { repo: "clankamode/api-client", criticality: "high", tier: "ops", description: "Client SDK" },
+        ]),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      query: "clankamode/clanka-api",
+      count: 1,
+      cached: true,
+      timestamp: expect.any(String),
+    }));
+    expect(body.tools).toEqual([
+      expect.objectContaining({ repo: "clankamode/clanka-api" }),
+    ]);
+  });
+
+  it("matches queries case-insensitively across repo and description fields", async () => {
+    const res = await worker.fetch(
+      req("/tools/search?q=TRIAGE"),
+      createEnv({
+        "registry:v1": JSON.stringify([
+          { repo: "clankamode/clanka-api", criticality: "critical", tier: "core", description: "Main API" },
+          { repo: "clankamode/ci-triage", criticality: "high", tier: "ops", description: "CI triage tool" },
+        ]),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.count).toBe(1);
+    expect(body.tools[0].repo).toBe("clankamode/ci-triage");
+  });
+
+  it("returns 400 when q is missing", async () => {
+    const res = await worker.fetch(req("/tools/search"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(400);
+    expect(body).toEqual({ error: "Missing query parameter: q" });
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/tools/search?q=clanka", "POST"), createEnv());
+    expect(res.status).toBe(405);
+  });
+});
+
 describe("Malformed cache fallbacks", () => {
   it("returns an empty tools payload when registry:v1 cache JSON is malformed", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
@@ -440,6 +496,167 @@ describe("Malformed cache fallbacks", () => {
 
     expect(res.status).toBe(200);
     expect(body).toEqual({ events: [] });
+  });
+});
+
+describe("GET /github/stats", () => {
+  it("serves a valid cached payload without calling GitHub", async () => {
+    const cached = {
+      repoCount: 7,
+      totalStars: 42,
+      lastPushedAt: "2026-03-01T00:00:00.000Z",
+      lastPushedRepo: "clanka-api",
+      cachedAt: "2026-03-01T00:05:00.000Z",
+    };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+
+    const res = await worker.fetch(
+      req("/github/stats"),
+      createEnv({ "github:stats:v1": JSON.stringify(cached) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(cached);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("aggregates repo counts, stars, and latest push from GitHub responses", async () => {
+    const putCalls: Array<{ key: string; opts?: any }> = [];
+    const kvStore: Record<string, string> = {};
+    const env = {
+      CLANKA_STATE: {
+        get: async (key: string) => kvStore[key] ?? null,
+        put: async (key: string, value: string, opts?: any) => {
+          kvStore[key] = value;
+          putCalls.push({ key, opts });
+        },
+      },
+      ADMIN_KEY: "test-secret",
+    };
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith("/users/clankamode")) {
+        return new Response(JSON.stringify({ public_repos: 9 }), { status: 200 });
+      }
+      if (url.includes("/users/clankamode/repos")) {
+        return new Response(JSON.stringify([
+          { name: "alpha", stargazers_count: 2, pushed_at: "2026-03-01T00:00:00.000Z" },
+          { name: "beta", stargazers_count: 5, pushed_at: "2026-03-02T00:00:00.000Z" },
+        ]), { status: 200 });
+      }
+      return new Response("Not Found", { status: 404 });
+    });
+
+    const res = await worker.fetch(req("/github/stats"), env as any);
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      repoCount: 9,
+      totalStars: 7,
+      lastPushedAt: "2026-03-02T00:00:00.000Z",
+      lastPushedRepo: "beta",
+      cachedAt: expect.any(String),
+    }));
+    expect(putCalls).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        key: "github:stats:v1",
+        opts: expect.objectContaining({ expirationTtl: 3600 }),
+      }),
+    ]));
+  });
+
+  it("returns safe defaults when GitHub fetch throws", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network down"));
+
+    const res = await worker.fetch(req("/github/stats"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      repoCount: 0,
+      totalStars: 0,
+      lastPushedAt: null,
+      lastPushedRepo: null,
+      cachedAt: expect.any(String),
+    }));
+  });
+
+  it("returns live stats even when caching the payload fails", async () => {
+    const env = {
+      CLANKA_STATE: {
+        get: async () => null,
+        put: async () => { throw new Error("kv unavailable"); },
+      },
+      ADMIN_KEY: "test-secret",
+    };
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith("/users/clankamode")) {
+        return new Response(JSON.stringify({ public_repos: 2 }), { status: 200 });
+      }
+      return new Response(JSON.stringify([
+        { name: "clanka-api", stargazers_count: 3, pushed_at: "2026-03-03T00:00:00.000Z" },
+      ]), { status: 200 });
+    });
+
+    const res = await worker.fetch(req("/github/stats"), env as any);
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      repoCount: 2,
+      totalStars: 3,
+      lastPushedAt: "2026-03-03T00:00:00.000Z",
+      lastPushedRepo: "clanka-api",
+    }));
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/github/stats", "POST"), createEnv());
+    expect(res.status).toBe(405);
+  });
+});
+
+describe("GET /github/events", () => {
+  it("returns cached events in the route payload", async () => {
+    const cached = [
+      {
+        type: "PUSH",
+        repo: "clanka-api",
+        message: "from cache",
+        timestamp: "2026-03-01T00:00:00.000Z",
+      },
+    ];
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+
+    const res = await worker.fetch(
+      req("/github/events"),
+      createEnv({ "github:events:v1": JSON.stringify(cached) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ events: cached });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns an empty events array when GitHub fetch throws", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network down"));
+
+    const res = await worker.fetch(req("/github/events"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ events: [] });
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/github/events", "POST"), createEnv());
+    expect(res.status).toBe(405);
   });
 });
 
@@ -1183,6 +1400,65 @@ describe("GET /fleet/health", () => {
   });
 });
 
+describe("GET /fleet/score", () => {
+  it("derives score and repo counts from fresh fleet health cache", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+    const res = await worker.fetch(
+      req("/fleet/score"),
+      createEnv({
+        "fleet:health:v1": JSON.stringify({
+          status: "RED",
+          checkedAt: new Date().toISOString(),
+          repos: [
+            { repo: "clankamode/clanka-api", criticality: "critical", conclusion: "success", lastRun: "2026-03-01T00:00:00.000Z" },
+            { repo: "clankamode/ci-triage", criticality: "high", conclusion: "failure", lastRun: "2026-03-01T00:00:00.000Z" },
+            { repo: "clankamode/docs", criticality: "medium", conclusion: "unknown", lastRun: null },
+          ],
+        }),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      score: 53,
+      status: "RED",
+      totalRepos: 3,
+      healthyRepos: 1,
+      degradedRepos: 1,
+      unknownRepos: 1,
+      timestamp: expect.any(String),
+    }));
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns an unknown score payload when fleet health cannot be loaded", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network down"));
+
+    const res = await worker.fetch(
+      req("/fleet/score"),
+      createEnv({ "registry:v1": JSON.stringify(MOCK_REGISTRY) }, { GITHUB_TOKEN: "gh-token" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      score: 0,
+      status: "UNKNOWN",
+      totalRepos: 0,
+      healthyRepos: 0,
+      degradedRepos: 0,
+      unknownRepos: 0,
+      timestamp: expect.any(String),
+    }));
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/fleet/score", "POST"), createEnv());
+    expect(res.status).toBe(405);
+  });
+});
+
 describe("GET /fleet/trend", () => {
   it("returns last 5 conclusions per repo and computed direction", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
@@ -1798,6 +2074,50 @@ describe("GET /status/uptime regression coverage", () => {
     expect(res.status).toBe(200);
     expect(body).toEqual({ status: "offline", uptime_ms: 0, last_seen: null });
   });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/status/uptime", "POST"), createEnv());
+    const body = await json(res);
+    expect(res.status).toBe(405);
+    expect(body).toEqual({ error: "Method Not Allowed" });
+  });
+});
+
+describe("GET /health", () => {
+  it("returns operational payload when heartbeat is fresh", async () => {
+    const now = 1_750_000_000_000;
+    const lastSeen = now - 2_000;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+
+    const res = await worker.fetch(
+      req("/health"),
+      createEnv({ last_seen: String(lastSeen) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      status: "operational",
+      signal: "⚡",
+      last_seen: new Date(lastSeen).toISOString(),
+      timestamp: expect.any(String),
+    }));
+  });
+
+  it("returns offline when heartbeat is stale or missing", async () => {
+    const res = await worker.fetch(req("/health"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ status: "offline" });
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/health", "POST"), createEnv());
+    const body = await json(res);
+    expect(res.status).toBe(405);
+    expect(body).toEqual({ error: "Method Not Allowed" });
+  });
 });
 
 describe("GET /metrics", () => {
@@ -2057,6 +2377,119 @@ describe("POST /admin/refresh", () => {
         opts: expect.objectContaining({ expirationTtl: 1 }),
       }),
     ]));
+  });
+});
+
+describe("Admin task CRUD", () => {
+  const authHeaders = { Authorization: "Bearer test-secret" };
+
+  it("returns 401 when auth is missing", async () => {
+    const res = await worker.fetch(req("/admin/tasks"), createEnv());
+    expect(res.status).toBe(401);
+  });
+
+  it("supports GET, POST, PUT, and DELETE against the tasks KV state", async () => {
+    const kvStore = {
+      tasks: JSON.stringify([
+        { id: "t1", text: "ship coverage", done: false },
+      ]),
+    };
+    const env = {
+      CLANKA_STATE: createMockKV(kvStore),
+      ADMIN_KEY: "test-secret",
+    };
+
+    const getRes = await worker.fetch(req("/admin/tasks", "GET", undefined, authHeaders), env as any);
+    expect(await json(getRes)).toEqual([{ id: "t1", text: "ship coverage", done: false }]);
+
+    const postRes = await worker.fetch(
+      req("/admin/tasks", "POST", { id: "t2", text: "verify branches", done: false }, authHeaders),
+      env as any,
+    );
+    expect(postRes.status).toBe(200);
+    expect(JSON.parse(kvStore.tasks)).toEqual([
+      { id: "t1", text: "ship coverage", done: false },
+      { id: "t2", text: "verify branches", done: false },
+    ]);
+
+    const putRes = await worker.fetch(
+      req("/admin/tasks", "PUT", { id: "t2", done: true }, authHeaders),
+      env as any,
+    );
+    expect(putRes.status).toBe(200);
+    expect(JSON.parse(kvStore.tasks)).toEqual([
+      { id: "t1", text: "ship coverage", done: false },
+      { id: "t2", text: "verify branches", done: true },
+    ]);
+
+    const deleteRes = await worker.fetch(
+      req("/admin/tasks", "DELETE", { id: "t1" }, authHeaders),
+      env as any,
+    );
+    expect(deleteRes.status).toBe(200);
+    expect(JSON.parse(kvStore.tasks)).toEqual([
+      { id: "t2", text: "verify branches", done: true },
+    ]);
+  });
+
+  it("falls back to an empty list when stored tasks JSON is malformed", async () => {
+    const res = await worker.fetch(
+      req("/admin/tasks", "GET", undefined, authHeaders),
+      createEnv({ tasks: "{invalid-json" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual([]);
+  });
+
+  it("returns 405 for unsupported methods", async () => {
+    const res = await worker.fetch(
+      req("/admin/tasks", "PATCH", { id: "t1" }, authHeaders),
+      createEnv(),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(405);
+    expect(body).toEqual({ error: "Method Not Allowed" });
+  });
+
+  it("returns 405 for unsupported methods even when KV is unavailable", async () => {
+    const env = {
+      CLANKA_STATE: {
+        get: async () => { throw new Error("kv unavailable"); },
+        put: async () => { throw new Error("kv unavailable"); },
+      },
+      ADMIN_KEY: "test-secret",
+    };
+    const res = await worker.fetch(
+      req("/admin/tasks", "PATCH", { id: "t1" }, authHeaders),
+      env as any,
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(405);
+    expect(body).toEqual({ error: "Method Not Allowed" });
+  });
+});
+
+describe("GET /posts/count", () => {
+  it("returns the static post count payload", async () => {
+    const res = await worker.fetch(req("/posts/count"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({
+      count: 11,
+      lastPost: "011",
+      lastPostDate: "2026-02-26",
+      lastPostSlug: "claude-cli-unlock",
+    });
+  });
+
+  it("rejects non-GET with 405", async () => {
+    const res = await worker.fetch(req("/posts/count", "POST"), createEnv());
+    expect(res.status).toBe(405);
   });
 });
 
