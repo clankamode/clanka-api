@@ -25,10 +25,16 @@ const STATUS_ENDPOINTS = [
 ];
 
 function createMockKV(store: Record<string, string> = {}): any {
+  const puts: Array<{ key: string; value: string; opts?: unknown }> = [];
   return {
     get: async (key: string) => store[key] ?? null,
-    put: async (key: string, value: string, _opts?: any) => { store[key] = value; },
+    put: async (key: string, value: string, opts?: unknown) => {
+      puts.push({ key, value, opts });
+      store[key] = value;
+    },
     delete: async (key: string) => { delete store[key]; },
+    __puts: puts,
+    __store: store,
   };
 }
 
@@ -64,9 +70,83 @@ async function json(res: Response) {
   return res.json();
 }
 
+function createExecutionContext() {
+  const pending: Promise<unknown>[] = [];
+  return {
+    ctx: {
+      waitUntil(promise: Promise<unknown>) {
+        pending.push(promise);
+      },
+    },
+    async flush() {
+      await Promise.all(pending);
+    },
+  };
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+});
+
+describe("request logging", () => {
+  it("logs method, path, status, ip, and TTL to CLANKA_STATE", async () => {
+    const env = createEnv();
+    const execution = createExecutionContext();
+
+    const res = await worker.fetch(
+      req("/status?verbose=1", "GET", undefined, {
+        "CF-Connecting-IP": "203.0.113.10",
+        "User-Agent": "vitest-agent",
+      }),
+      env,
+      execution.ctx as any,
+    );
+    await execution.flush();
+
+    expect(res.status).toBe(200);
+    const requestLogCall = env.CLANKA_STATE.__puts.find((call: any) => call.key === "request_log");
+    expect(requestLogCall).toBeDefined();
+    expect(requestLogCall.opts).toEqual(expect.objectContaining({ expirationTtl: 7 * 24 * 60 * 60 }));
+
+    const logEntries = JSON.parse(env.CLANKA_STATE.__store.request_log);
+    expect(logEntries).toHaveLength(1);
+    expect(logEntries[0]).toEqual(expect.objectContaining({
+      timestamp: expect.any(Number),
+      method: "GET",
+      path: "/status?verbose=1",
+      status: 200,
+      ip: "203.0.113.10",
+      ua: "vitest-agent",
+    }));
+  });
+
+  it("keeps only the latest 100 request log entries", async () => {
+    const existingEntries = Array.from({ length: 100 }, (_, index) => ({
+      timestamp: index,
+      method: "GET",
+      path: `/existing-${index}`,
+      status: 200,
+      ip: "198.51.100.1",
+    }));
+    const env = createEnv({
+      request_log: JSON.stringify(existingEntries),
+    });
+    const execution = createExecutionContext();
+
+    const res = await worker.fetch(req("/missing"), env, execution.ctx as any);
+    await execution.flush();
+
+    expect(res.status).toBe(404);
+    const logEntries = JSON.parse(env.CLANKA_STATE.__store.request_log);
+    expect(logEntries).toHaveLength(100);
+    expect(logEntries[0]).toEqual(expect.objectContaining({ path: "/existing-1" }));
+    expect(logEntries[99]).toEqual(expect.objectContaining({
+      method: "GET",
+      path: "/missing",
+      status: 404,
+    }));
+  });
 });
 
 // /projects

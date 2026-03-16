@@ -46,7 +46,14 @@ type FleetScorePayload = {
 type HistoryEntry = { timestamp: number; desc: string; type: string; hash: string };
 
 type Project = { name: string; description: string; url: string; status: string; last_updated: string };
-type RequestLogEntry = { timestamp: number; method: string; pathname: string; query: string; ip: string; ua?: string };
+type RequestLogEntry = {
+  timestamp: number;
+  method: string;
+  path: string;
+  status: number;
+  ip: string;
+  ua?: string;
+};
 type ChangelogEntry = {
   sha: string;
   message: string;
@@ -63,7 +70,7 @@ const REGISTRY_STALE_TTL_SEC = 7 * 24 * 60 * 60; // 7 days
 const TOOLS_REGISTRY_TTL_SEC = 5 * 60; // 5 minutes
 
 const REQUEST_LOG_KEY = "request_log";
-const REQUEST_LOG_TTL_SEC = 24 * 60 * 60; // 24h
+const REQUEST_LOG_TTL_SEC = 7 * 24 * 60 * 60; // 7 days
 const REQUEST_LOG_LIMIT = 100;
 
 const LAST_SEEN_KEY = "last_seen";
@@ -667,7 +674,7 @@ function getStatusUptimePayload(lastSeenRaw: string | null) {
   };
 }
 
-async function logRequest(env: Env, request: Request): Promise<void> {
+async function logRequest(env: Env, request: Request, response: Response): Promise<void> {
   const url = new URL(request.url);
   const rawLog = await env.CLANKA_STATE.get(REQUEST_LOG_KEY);
   let requestLog = safeParseJSON<unknown[]>(rawLog, []);
@@ -678,8 +685,8 @@ async function logRequest(env: Env, request: Request): Promise<void> {
   const nextLog: RequestLogEntry[] = [...requestLog, {
     timestamp: Date.now(),
     method: request.method,
-    pathname: url.pathname,
-    query: url.search,
+    path: `${url.pathname}${url.search}`,
+    status: response.status,
     ip: getClientIp(request),
     ua: request.headers.get("User-Agent") || undefined,
   }];
@@ -1593,20 +1600,27 @@ export default {
       void metricsUpdate;
     }
 
-    try {
-      await logRequest(env, request);
-    } catch {
-      // ignore logging errors
-    }
+    const respond = (body?: BodyInit | null, init?: ResponseInit): Response => {
+      const response = new Response(body, init);
+      const logging = logRequest(env, request, response).catch(() => {
+        // ignore logging errors
+      });
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(logging);
+      } else {
+        void logging;
+      }
+      return response;
+    };
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
+      return respond(null, { headers: corsHeaders });
     }
 
     if (request.method === "GET" && isPublicGetEndpoint(url.pathname) && !isTestEnvironment()) {
       const rateLimit = await checkRateLimit(env, request);
       if (!rateLimit.allowed) {
-        return new Response(JSON.stringify({ error: "Too Many Requests" }), {
+        return respond(JSON.stringify({ error: "Too Many Requests" }), {
           status: 429,
           headers: {
             ...corsHeaders,
@@ -1628,7 +1642,7 @@ export default {
         } catch (e) {
           // ignore logging errors
         }
-        return new Response(`Unauthorized`, { status: 401 });
+        return respond(`Unauthorized`, { status: 401 });
       }
 
       const validationError = JSON.stringify({
@@ -1639,11 +1653,11 @@ export default {
       try {
         body = await request.json();
       } catch {
-        return new Response(validationError, { status: 400, headers: corsHeaders });
+        return respond(validationError, { status: 400, headers: corsHeaders });
       }
 
       if (!body || typeof body !== "object" || Array.isArray(body)) {
-        return new Response(validationError, { status: 400, headers: corsHeaders });
+        return respond(validationError, { status: 400, headers: corsHeaders });
       }
 
       const payload = body as {
@@ -1659,7 +1673,7 @@ export default {
       const hasActivity = payload.activity && typeof payload.activity === "object" && !Array.isArray(payload.activity);
 
       if (!hasPresence || !hasTeam || !hasActivity) {
-        return new Response(validationError, { status: 400, headers: corsHeaders });
+        return respond(validationError, { status: 400, headers: corsHeaders });
       }
 
       const presence = payload.presence as { state?: unknown; message?: unknown };
@@ -1693,12 +1707,12 @@ export default {
       await env.CLANKA_STATE.put("presence", JSON.stringify({ state, message, timestamp: now }), {
         expirationTtl: ttl,
       });
-      return new Response(JSON.stringify({ success: true }), { headers: corsHeaders });
+      return respond(JSON.stringify({ success: true }), { headers: corsHeaders });
     }
 
     if (url.pathname === "/heartbeat" && request.method === "POST") {
       if (!isAuthorized(request, env)) {
-        return new Response("Unauthorized", { status: 401 });
+        return respond("Unauthorized", { status: 401 });
       }
 
       let body: unknown = {};
@@ -1709,7 +1723,7 @@ export default {
       }
 
       if (body === null || typeof body !== "object" || Array.isArray(body)) {
-        return new Response(JSON.stringify({ error: "Invalid body" }), {
+        return respond(JSON.stringify({ error: "Invalid body" }), {
           status: 400,
           headers: corsHeaders,
         });
@@ -1717,7 +1731,7 @@ export default {
 
       const payload = body as { history?: unknown };
       if (payload.history !== undefined && !Array.isArray(payload.history)) {
-        return new Response(JSON.stringify({ error: "Invalid body: history must be an array" }), {
+        return respond(JSON.stringify({ error: "Invalid body: history must be an array" }), {
           status: 400,
           headers: corsHeaders,
         });
@@ -1725,7 +1739,7 @@ export default {
 
       const heartbeatHistory = payload.history ?? [];
       if (Array.isArray(heartbeatHistory) && heartbeatHistory.some((entry) => !entry || typeof entry !== "object" || Array.isArray(entry))) {
-        return new Response(JSON.stringify({ error: "Invalid body: history entries must be objects" }), {
+        return respond(JSON.stringify({ error: "Invalid body: history entries must be objects" }), {
           status: 400,
           headers: corsHeaders,
         });
@@ -1748,7 +1762,7 @@ export default {
         await env.CLANKA_STATE.put("started", String(now));
       }
 
-      return new Response(JSON.stringify({
+      return respond(JSON.stringify({
         success: true,
         status: "operational",
         last_seen: new Date(now).toISOString(),
@@ -1757,7 +1771,7 @@ export default {
 
     if (url.pathname === "/history") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
@@ -1775,20 +1789,20 @@ export default {
         .sort((a, b) => b.timestamp - a.timestamp)
         .slice(0, limit);
 
-      return new Response(JSON.stringify({ history, count: history.length }), {
+      return respond(JSON.stringify({ history, count: history.length }), {
         headers: corsHeaders,
       });
     }
 
     if (url.pathname === "/status") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
       }
 
-      return new Response(JSON.stringify({
+      return respond(JSON.stringify({
         ok: true,
         version: API_VERSION,
         timestamp: new Date().toISOString(),
@@ -1798,7 +1812,7 @@ export default {
 
     if (url.pathname === "/metrics") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
@@ -1806,7 +1820,7 @@ export default {
 
       const expectedToken = typeof env.ADMIN_TOKEN === "string" ? env.ADMIN_TOKEN.trim() : "";
       if (!expectedToken) {
-        return new Response(JSON.stringify({ error: "metrics_unavailable" }), {
+        return respond(JSON.stringify({ error: "metrics_unavailable" }), {
           status: 503,
           headers: noCacheHeaders,
         });
@@ -1814,14 +1828,14 @@ export default {
 
       const providedToken = request.headers.get("X-Admin-Token");
       if (providedToken !== expectedToken) {
-        return new Response(JSON.stringify({ error: "unauthorized" }), {
+        return respond(JSON.stringify({ error: "unauthorized" }), {
           status: 401,
           headers: noCacheHeaders,
         });
       }
 
       const metrics = await loadMetrics(env);
-      return new Response(JSON.stringify({
+      return respond(JSON.stringify({
         uptime_ms: Math.max(0, Date.now() - startTime),
         requests_total: metrics.requests_total,
         kv_hits: metrics.kv_hits,
@@ -1832,7 +1846,7 @@ export default {
 
     if (url.pathname === "/admin/refresh") {
       if (request.method !== "POST") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: noCacheHeaders,
         });
@@ -1840,7 +1854,7 @@ export default {
 
       const expectedToken = typeof env.ADMIN_TOKEN === "string" ? env.ADMIN_TOKEN.trim() : "";
       if (!expectedToken) {
-        return new Response(JSON.stringify({ error: "refresh_unavailable" }), {
+        return respond(JSON.stringify({ error: "refresh_unavailable" }), {
           status: 503,
           headers: noCacheHeaders,
         });
@@ -1848,7 +1862,7 @@ export default {
 
       const providedToken = request.headers.get("ADMIN_TOKEN");
       if (providedToken !== expectedToken) {
-        return new Response(JSON.stringify({ error: "unauthorized" }), {
+        return respond(JSON.stringify({ error: "unauthorized" }), {
           status: 401,
           headers: noCacheHeaders,
         });
@@ -1856,7 +1870,7 @@ export default {
 
       const keys = await collectCacheKeysToInvalidate(env);
       await Promise.all(keys.map(async (key) => invalidateCacheKey(env, key)));
-      return new Response(JSON.stringify({
+      return respond(JSON.stringify({
         success: true,
         invalidated: keys.length,
         keys,
@@ -1866,44 +1880,44 @@ export default {
 
     if (url.pathname === "/status/uptime") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
       }
 
       const lastSeenRaw = await env.CLANKA_STATE.get(LAST_SEEN_KEY);
-      return new Response(JSON.stringify(getStatusUptimePayload(lastSeenRaw)), { headers: corsHeaders });
+      return respond(JSON.stringify(getStatusUptimePayload(lastSeenRaw)), { headers: corsHeaders });
     }
 
     if (url.pathname === "/health") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
       }
 
       const lastSeenRaw = await env.CLANKA_STATE.get(LAST_SEEN_KEY);
-      return new Response(JSON.stringify(getStatusPayload(lastSeenRaw)), { headers: corsHeaders });
+      return respond(JSON.stringify(getStatusPayload(lastSeenRaw)), { headers: corsHeaders });
     }
 
     if (url.pathname === "/openapi.json") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
       }
 
-      return new Response(JSON.stringify(OPENAPI_SPEC), {
+      return respond(JSON.stringify(OPENAPI_SPEC), {
         headers: { ...corsHeaders },
       });
     }
 
     if (url.pathname === "/fleet/summary") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
@@ -1943,7 +1957,7 @@ export default {
         byCriticality[criticality].sort((a, b) => a.localeCompare(b));
       }
 
-      return new Response(
+      return respond(
         JSON.stringify({
           generatedAt: new Date().toISOString(),
           totalRepos: fleetItems.length,
@@ -1958,7 +1972,7 @@ export default {
 
     if (url.pathname === "/fleet/health") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
@@ -1966,17 +1980,17 @@ export default {
 
       const cachedPayload = parseFleetHealthPayload(await env.CLANKA_STATE.get(FLEET_HEALTH_CACHE_KEY));
       if (cachedPayload && isFleetHealthFresh(cachedPayload)) {
-        return new Response(JSON.stringify(cachedPayload), { headers: corsHeaders });
+        return respond(JSON.stringify(cachedPayload), { headers: corsHeaders });
       }
 
       try {
         const payload = await loadFleetHealthFromGithub(env);
-        return new Response(JSON.stringify(payload), { headers: corsHeaders });
+        return respond(JSON.stringify(payload), { headers: corsHeaders });
       } catch {
         if (cachedPayload) {
-          return new Response(JSON.stringify(cachedPayload), { headers: corsHeaders });
+          return respond(JSON.stringify(cachedPayload), { headers: corsHeaders });
         }
-        return new Response(JSON.stringify({ error: "Service Unavailable" }), {
+        return respond(JSON.stringify({ error: "Service Unavailable" }), {
           status: 503,
           headers: corsHeaders,
         });
@@ -1985,19 +1999,19 @@ export default {
 
     if (url.pathname === "/fleet/score") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
       }
 
       const payload = await loadFleetScorePayload(env);
-      return new Response(JSON.stringify(payload), { headers: corsHeaders });
+      return respond(JSON.stringify(payload), { headers: corsHeaders });
     }
 
     if (url.pathname === "/pulse") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
@@ -2013,7 +2027,7 @@ export default {
       const team = safeParseJSON<unknown>(teamRaw || "{}", {});
       const agentsActive = countActiveAgents(team);
 
-      return new Response(
+      return respond(
         JSON.stringify({
           ts: new Date().toISOString(),
           status: presence?.state || "active",
@@ -2027,13 +2041,13 @@ export default {
     // Tasks CRUD (admin only)
     if (url.pathname === "/admin/tasks") {
       if (!isAuthorized(request, env)) {
-        return new Response('Unauthorized', { status: 401 });
+        return respond('Unauthorized', { status: 401 });
       }
 
       if (request.method === 'GET') {
         const tasksRaw = await env.CLANKA_STATE.get("tasks") || "[]";
         const tasks = safeParseJSON<unknown[]>(tasksRaw, []);
-        return new Response(JSON.stringify(tasks), { headers: corsHeaders });
+        return respond(JSON.stringify(tasks), { headers: corsHeaders });
       }
 
       if (request.method === 'POST') {
@@ -2042,7 +2056,7 @@ export default {
         const tasks = safeParseJSON<unknown[]>(tasksRaw, []);
         tasks.push(body);
         await env.CLANKA_STATE.put("tasks", JSON.stringify(tasks));
-        return new Response(JSON.stringify({ success: true }), { headers: corsHeaders });
+        return respond(JSON.stringify({ success: true }), { headers: corsHeaders });
       }
 
       if (request.method === 'PUT') {
@@ -2057,7 +2071,7 @@ export default {
             : task;
         });
         await env.CLANKA_STATE.put("tasks", JSON.stringify(nextTasks));
-        return new Response(JSON.stringify({ success: true }), { headers: corsHeaders });
+        return respond(JSON.stringify({ success: true }), { headers: corsHeaders });
       }
 
       if (request.method === 'DELETE') {
@@ -2069,10 +2083,10 @@ export default {
           return (task as { id?: unknown }).id !== body.id;
         });
         await env.CLANKA_STATE.put("tasks", JSON.stringify(nextTasks));
-        return new Response(JSON.stringify({ success: true }), { headers: corsHeaders });
+        return respond(JSON.stringify({ success: true }), { headers: corsHeaders });
       }
 
-      return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+      return respond(JSON.stringify({ error: "Method Not Allowed" }), {
         status: 405,
         headers: corsHeaders,
       });
@@ -2080,11 +2094,11 @@ export default {
 
     if (url.pathname === "/admin/activity") {
       if (!isAuthorized(request, env)) {
-        return new Response("Unauthorized", { status: 401 });
+        return respond("Unauthorized", { status: 401 });
       }
 
       if (request.method !== "POST") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
@@ -2094,7 +2108,7 @@ export default {
       const desc = typeof body.desc === "string" ? body.desc.trim() : "";
       const type = typeof body.type === "string" ? body.type.trim() : "";
       if (!desc || !type) {
-        return new Response(JSON.stringify({ error: "Invalid body" }), {
+        return respond(JSON.stringify({ error: "Invalid body" }), {
           status: 400,
           headers: corsHeaders,
         });
@@ -2107,12 +2121,12 @@ export default {
       const nextHistory = history.slice(0, HISTORY_LIMIT);
       await env.CLANKA_STATE.put("history", JSON.stringify(nextHistory));
 
-      return new Response(JSON.stringify({ success: true, entry }), { headers: corsHeaders });
+      return respond(JSON.stringify({ success: true, entry }), { headers: corsHeaders });
     }
 
     if (url.pathname === "/projects") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
@@ -2123,7 +2137,7 @@ export default {
         ? registryEntriesToProjects(entries)
         : [];
 
-      return new Response(
+      return respond(
         JSON.stringify({ projects, source: "registry", cached: true }),
         { headers: corsHeaders },
       );
@@ -2131,7 +2145,7 @@ export default {
 
     if (url.pathname === "/tools/search") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
@@ -2139,7 +2153,7 @@ export default {
 
       const query = url.searchParams.get("q")?.trim() || "";
       if (!query) {
-        return new Response(JSON.stringify({ error: "Missing query parameter: q" }), {
+        return respond(JSON.stringify({ error: "Missing query parameter: q" }), {
           status: 400,
           headers: corsHeaders,
         });
@@ -2147,7 +2161,7 @@ export default {
 
       const { entries, cached } = await loadToolsRegistryEntries(env);
       const tools = searchRegistryTools(entries, query);
-      return new Response(JSON.stringify({
+      return respond(JSON.stringify({
         query,
         count: tools.length,
         tools,
@@ -2158,7 +2172,7 @@ export default {
 
     if (url.pathname === "/tools") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
@@ -2166,7 +2180,7 @@ export default {
 
       const { entries, cached } = await loadToolsRegistryEntries(env);
 
-      return new Response(
+      return respond(
         JSON.stringify({
           tools: entries,
           count: entries.length,
@@ -2179,7 +2193,7 @@ export default {
 
     if (url.pathname.startsWith("/tools/")) {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
@@ -2189,7 +2203,7 @@ export default {
       try {
         rawRepo = decodeURIComponent(url.pathname.slice("/tools/".length)).trim();
       } catch {
-        return new Response(JSON.stringify({ error: "Invalid repo path" }), {
+        return respond(JSON.stringify({ error: "Invalid repo path" }), {
           status: 400,
           headers: corsHeaders,
         });
@@ -2197,13 +2211,13 @@ export default {
       const { entries, cached } = await loadToolsRegistryEntries(env);
       const match = entries.find((entry) => entry.repo.toLowerCase() === rawRepo.toLowerCase());
       if (!match) {
-        return new Response(JSON.stringify({ error: "Tool Not Found" }), {
+        return respond(JSON.stringify({ error: "Tool Not Found" }), {
           status: 404,
           headers: corsHeaders,
         });
       }
 
-      return new Response(JSON.stringify({
+      return respond(JSON.stringify({
         tool: match,
         cached,
         timestamp: new Date().toISOString(),
@@ -2212,19 +2226,19 @@ export default {
 
     if (url.pathname === "/fleet/trend") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
       }
 
       const payload = await loadFleetTrendFromGithub(env);
-      return new Response(JSON.stringify(payload), { headers: corsHeaders });
+      return respond(JSON.stringify(payload), { headers: corsHeaders });
     }
 
     if (url.pathname === "/tasks") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
@@ -2239,12 +2253,12 @@ export default {
         })),
       );
 
-      return new Response(JSON.stringify(payload), { headers: corsHeaders });
+      return respond(JSON.stringify(payload), { headers: corsHeaders });
     }
 
     if (url.pathname === "/now") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
@@ -2276,7 +2290,7 @@ export default {
           : now;
       const isOffline = now - lastSeenMs > STATUS_OFFLINE_THRESHOLD_MS;
 
-      return new Response(JSON.stringify({
+      return respond(JSON.stringify({
         current: presence?.message || "monitoring workspace and building public signals",
         status: isOffline ? "offline" : (presence?.state || "active"),
         signal: "⚡",
@@ -2292,27 +2306,27 @@ export default {
 
     if (url.pathname === "/github/stats") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
       }
 
       const stats = await loadGithubStats(env);
-      return new Response(JSON.stringify(stats), { headers: corsHeaders });
+      return respond(JSON.stringify(stats), { headers: corsHeaders });
     }
 
     if (url.pathname === "/github/events") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), { status: 405, headers: corsHeaders });
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), { status: 405, headers: corsHeaders });
       }
       const events = await loadGithubEvents(env.CLANKA_STATE);
-      return new Response(JSON.stringify({ events }), { headers: corsHeaders });
+      return respond(JSON.stringify({ events }), { headers: corsHeaders });
     }
 
     if (url.pathname === "/changelog") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
@@ -2320,7 +2334,7 @@ export default {
 
       const token = typeof env.GITHUB_TOKEN === "string" ? env.GITHUB_TOKEN.trim() : "";
       if (!token) {
-        return new Response(JSON.stringify({
+        return respond(JSON.stringify({
           commits: [],
           error: "no token",
           timestamp: new Date().toISOString(),
@@ -2328,7 +2342,7 @@ export default {
       }
 
       const commits = await loadChangelog(env);
-      return new Response(JSON.stringify({
+      return respond(JSON.stringify({
         commits,
         timestamp: new Date().toISOString(),
       }), { headers: corsHeaders });
@@ -2336,19 +2350,19 @@ export default {
 
     if (url.pathname === "/posts/count") {
       if (request.method !== "GET") {
-        return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        return respond(JSON.stringify({ error: "Method Not Allowed" }), {
           status: 405,
           headers: corsHeaders,
         });
       }
 
-      return new Response(
+      return respond(
         JSON.stringify({ count: 11, lastPost: "011", lastPostDate: "2026-02-26", lastPostSlug: "claude-cli-unlock" }),
         { headers: corsHeaders },
       );
     }
 
-    return new Response(JSON.stringify({ error: "Not Found" }), {
+    return respond(JSON.stringify({ error: "Not Found" }), {
       status: 404,
       headers: corsHeaders,
     });
