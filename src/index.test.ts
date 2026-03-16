@@ -2604,25 +2604,78 @@ describe("Rate limiting", () => {
 });
 
 describe("Auth middleware", () => {
-  it("returns 401 when auth is missing", async () => {
-    const res = await worker.fetch(req("/set-presence", "POST", {}), createEnv());
+  const adminRoutes = [
+    { name: "/set-presence", path: "/set-presence", method: "POST", body: VALID_SET_PRESENCE_PAYLOAD },
+    { name: "/heartbeat", path: "/heartbeat", method: "POST", body: {} },
+    { name: "/admin/tasks", path: "/admin/tasks", method: "GET", body: undefined },
+    { name: "/admin/activity", path: "/admin/activity", method: "POST", body: { desc: "ok", type: "SYNC" } },
+  ] as const;
+
+  const malformedAuthHeaders = [
+    { label: "wrong bearer token", value: "Bearer wrong-token" },
+    { label: "missing bearer prefix", value: "test-secret" },
+    { label: "missing token", value: "Bearer" },
+    { label: "lowercase bearer prefix", value: "bearer test-secret" },
+    { label: "extra whitespace", value: "Bearer  test-secret" },
+  ] as const;
+
+  it.each(adminRoutes)("allows access to $name with the exact bearer token", async ({ path, method, body }) => {
+    const res = await worker.fetch(
+      req(path, method, body, { Authorization: "Bearer test-secret" }),
+      createEnv(),
+    );
+
+    expect(res.status).not.toBe(401);
+  });
+
+  it.each(adminRoutes)("returns 401 when auth is missing for $name", async ({ path, method, body }) => {
+    const res = await worker.fetch(req(path, method, body), createEnv());
     expect(res.status).toBe(401);
   });
 
-  it("returns 401 when token is invalid", async () => {
-    const res = await worker.fetch(
-      req("/set-presence", "POST", {}, { Authorization: "Bearer wrong-token" }),
-      createEnv(),
-    );
-    expect(res.status).toBe(401);
-  });
+  it.each(adminRoutes)(
+    "returns 401 for malformed auth headers on $name",
+    async ({ path, method, body }) => {
+      for (const authCase of malformedAuthHeaders) {
+        const res = await worker.fetch(
+          req(path, method, body, { Authorization: authCase.value }),
+          createEnv(),
+        );
 
-  it("returns 200 when token is valid", async () => {
+        expect(res.status, `${path} should reject ${authCase.label}`).toBe(401);
+      }
+    },
+  );
+
+  it("logs failed auth attempts for /set-presence", async () => {
+    const putCalls: Array<{ key: string; value: string; opts?: unknown }> = [];
+    const env = {
+      CLANKA_STATE: {
+        get: async (key: string) => ({ "registry:v1": JSON.stringify(MOCK_REGISTRY) })[key] ?? null,
+        put: async (key: string, value: string, opts?: unknown) => {
+          putCalls.push({ key, value, opts });
+        },
+        delete: async () => {},
+      },
+      ADMIN_KEY: "test-secret",
+    };
+
     const res = await worker.fetch(
-      req("/set-presence", "POST", VALID_SET_PRESENCE_PAYLOAD, { Authorization: "Bearer test-secret" }),
-      createEnv(),
+      req("/set-presence", "POST", VALID_SET_PRESENCE_PAYLOAD, { Authorization: "Bearer wrong-token" }),
+      env as any,
     );
-    expect(res.status).toBe(200);
+
+    expect(res.status).toBe(401);
+    const authFailCall = putCalls.find((call) => /^auth_fail:\d+:\d+$/.test(call.key));
+
+    expect(authFailCall).toBeDefined();
+    expect(JSON.parse(authFailCall!.value as string)).toEqual(
+      expect.objectContaining({
+        path: "/set-presence",
+        timestamp: expect.any(Number),
+      }),
+    );
+    expect(authFailCall!.opts).toEqual(expect.objectContaining({ expirationTtl: 60 * 60 * 24 * 30 }));
   });
 });
 
