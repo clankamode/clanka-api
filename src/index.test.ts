@@ -25,10 +25,16 @@ const STATUS_ENDPOINTS = [
 ];
 
 function createMockKV(store: Record<string, string> = {}): any {
+  const puts: Array<{ key: string; value: string; opts?: unknown }> = [];
   return {
     get: async (key: string) => store[key] ?? null,
-    put: async (key: string, value: string, _opts?: any) => { store[key] = value; },
+    put: async (key: string, value: string, opts?: unknown) => {
+      puts.push({ key, value, opts });
+      store[key] = value;
+    },
     delete: async (key: string) => { delete store[key]; },
+    __puts: puts,
+    __store: store,
   };
 }
 
@@ -64,9 +70,83 @@ async function json(res: Response) {
   return res.json();
 }
 
+function createExecutionContext() {
+  const pending: Promise<unknown>[] = [];
+  return {
+    ctx: {
+      waitUntil(promise: Promise<unknown>) {
+        pending.push(promise);
+      },
+    },
+    async flush() {
+      await Promise.all(pending);
+    },
+  };
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+});
+
+describe("request logging", () => {
+  it("logs method, path, status, ip, and TTL to CLANKA_STATE", async () => {
+    const env = createEnv();
+    const execution = createExecutionContext();
+
+    const res = await worker.fetch(
+      req("/status?verbose=1", "GET", undefined, {
+        "CF-Connecting-IP": "203.0.113.10",
+        "User-Agent": "vitest-agent",
+      }),
+      env,
+      execution.ctx as any,
+    );
+    await execution.flush();
+
+    expect(res.status).toBe(200);
+    const requestLogCall = env.CLANKA_STATE.__puts.find((call: any) => call.key === "request_log");
+    expect(requestLogCall).toBeDefined();
+    expect(requestLogCall.opts).toEqual(expect.objectContaining({ expirationTtl: 7 * 24 * 60 * 60 }));
+
+    const logEntries = JSON.parse(env.CLANKA_STATE.__store.request_log);
+    expect(logEntries).toHaveLength(1);
+    expect(logEntries[0]).toEqual(expect.objectContaining({
+      timestamp: expect.any(Number),
+      method: "GET",
+      path: "/status?verbose=1",
+      status: 200,
+      ip: "203.0.113.10",
+      ua: "vitest-agent",
+    }));
+  });
+
+  it("keeps only the latest 100 request log entries", async () => {
+    const existingEntries = Array.from({ length: 100 }, (_, index) => ({
+      timestamp: index,
+      method: "GET",
+      path: `/existing-${index}`,
+      status: 200,
+      ip: "198.51.100.1",
+    }));
+    const env = createEnv({
+      request_log: JSON.stringify(existingEntries),
+    });
+    const execution = createExecutionContext();
+
+    const res = await worker.fetch(req("/missing"), env, execution.ctx as any);
+    await execution.flush();
+
+    expect(res.status).toBe(404);
+    const logEntries = JSON.parse(env.CLANKA_STATE.__store.request_log);
+    expect(logEntries).toHaveLength(100);
+    expect(logEntries[0]).toEqual(expect.objectContaining({ path: "/existing-1" }));
+    expect(logEntries[99]).toEqual(expect.objectContaining({
+      method: "GET",
+      path: "/missing",
+      status: 404,
+    }));
+  });
 });
 
 // /projects
@@ -2604,25 +2684,78 @@ describe("Rate limiting", () => {
 });
 
 describe("Auth middleware", () => {
-  it("returns 401 when auth is missing", async () => {
-    const res = await worker.fetch(req("/set-presence", "POST", {}), createEnv());
+  const adminRoutes = [
+    { name: "/set-presence", path: "/set-presence", method: "POST", body: VALID_SET_PRESENCE_PAYLOAD },
+    { name: "/heartbeat", path: "/heartbeat", method: "POST", body: {} },
+    { name: "/admin/tasks", path: "/admin/tasks", method: "GET", body: undefined },
+    { name: "/admin/activity", path: "/admin/activity", method: "POST", body: { desc: "ok", type: "SYNC" } },
+  ] as const;
+
+  const malformedAuthHeaders = [
+    { label: "wrong bearer token", value: "Bearer wrong-token" },
+    { label: "missing bearer prefix", value: "test-secret" },
+    { label: "missing token", value: "Bearer" },
+    { label: "lowercase bearer prefix", value: "bearer test-secret" },
+    { label: "extra whitespace", value: "Bearer  test-secret" },
+  ] as const;
+
+  it.each(adminRoutes)("allows access to $name with the exact bearer token", async ({ path, method, body }) => {
+    const res = await worker.fetch(
+      req(path, method, body, { Authorization: "Bearer test-secret" }),
+      createEnv(),
+    );
+
+    expect(res.status).not.toBe(401);
+  });
+
+  it.each(adminRoutes)("returns 401 when auth is missing for $name", async ({ path, method, body }) => {
+    const res = await worker.fetch(req(path, method, body), createEnv());
     expect(res.status).toBe(401);
   });
 
-  it("returns 401 when token is invalid", async () => {
-    const res = await worker.fetch(
-      req("/set-presence", "POST", {}, { Authorization: "Bearer wrong-token" }),
-      createEnv(),
-    );
-    expect(res.status).toBe(401);
-  });
+  it.each(adminRoutes)(
+    "returns 401 for malformed auth headers on $name",
+    async ({ path, method, body }) => {
+      for (const authCase of malformedAuthHeaders) {
+        const res = await worker.fetch(
+          req(path, method, body, { Authorization: authCase.value }),
+          createEnv(),
+        );
 
-  it("returns 200 when token is valid", async () => {
+        expect(res.status, `${path} should reject ${authCase.label}`).toBe(401);
+      }
+    },
+  );
+
+  it("logs failed auth attempts for /set-presence", async () => {
+    const putCalls: Array<{ key: string; value: string; opts?: unknown }> = [];
+    const env = {
+      CLANKA_STATE: {
+        get: async (key: string) => ({ "registry:v1": JSON.stringify(MOCK_REGISTRY) })[key] ?? null,
+        put: async (key: string, value: string, opts?: unknown) => {
+          putCalls.push({ key, value, opts });
+        },
+        delete: async () => {},
+      },
+      ADMIN_KEY: "test-secret",
+    };
+
     const res = await worker.fetch(
-      req("/set-presence", "POST", VALID_SET_PRESENCE_PAYLOAD, { Authorization: "Bearer test-secret" }),
-      createEnv(),
+      req("/set-presence", "POST", VALID_SET_PRESENCE_PAYLOAD, { Authorization: "Bearer wrong-token" }),
+      env as any,
     );
-    expect(res.status).toBe(200);
+
+    expect(res.status).toBe(401);
+    const authFailCall = putCalls.find((call) => /^auth_fail:\d+:\d+$/.test(call.key));
+
+    expect(authFailCall).toBeDefined();
+    expect(JSON.parse(authFailCall!.value as string)).toEqual(
+      expect.objectContaining({
+        path: "/set-presence",
+        timestamp: expect.any(Number),
+      }),
+    );
+    expect(authFailCall!.opts).toEqual(expect.objectContaining({ expirationTtl: 60 * 60 * 24 * 30 }));
   });
 });
 
