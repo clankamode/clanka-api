@@ -2557,7 +2557,7 @@ describe("GET /posts/count", () => {
   it("returns blog post count derived from GitHub posts directory listing", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const u = String(input);
-      if (u.includes("clankamode.github.io") && u.includes("/contents/posts")) {
+      if (u === "https://api.github.com/repos/clankamode/clankamode.github.io/contents/posts") {
         return new Response(JSON.stringify([
           { name: "2026-01-01-older-post.html", type: "file" },
           { name: "2026-04-09-the-telemetry-trap.html", type: "file" },
