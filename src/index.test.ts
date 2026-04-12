@@ -2554,17 +2554,31 @@ describe("Admin task CRUD", () => {
 });
 
 describe("GET /posts/count", () => {
-  it("returns the static post count payload", async () => {
+  it("returns blog post count derived from GitHub posts directory listing", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const u = String(input);
+      if (u.includes("clankamode.github.io") && u.includes("/contents/posts")) {
+        return new Response(JSON.stringify([
+          { name: "2026-01-01-older-post.html", type: "file" },
+          { name: "2026-04-09-the-telemetry-trap.html", type: "file" },
+          { name: "README.md", type: "file" },
+          { name: "invalid-name.html", type: "file" },
+        ]));
+      }
+      return new Response("{}", { status: 404 });
+    });
+
     const res = await worker.fetch(req("/posts/count"), createEnv());
     const body = await json(res);
 
     expect(res.status).toBe(200);
     expect(body).toEqual({
-      count: 11,
-      lastPost: "011",
-      lastPostDate: "2026-02-26",
-      lastPostSlug: "claude-cli-unlock",
+      count: 2,
+      lastPost: "002",
+      lastPostDate: "2026-04-09",
+      lastPostSlug: "the-telemetry-trap",
     });
+    fetchSpy.mockRestore();
   });
 
   it("rejects non-GET with 405", async () => {
