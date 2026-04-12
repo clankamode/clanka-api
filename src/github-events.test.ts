@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { loadGithubEvents } from "./github-events";
+import { loadGithubEvents } from "./github";
 
 function createMockKV(store: Record<string, string> = {}): KVNamespace {
   return {
