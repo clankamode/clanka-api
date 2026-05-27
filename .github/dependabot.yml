@@ -3,11 +3,5 @@ updates:
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
-    groups:
-      dependencies:
-        patterns:
-          - "*"
-    labels:
-      - "dependencies"
+      interval: "monthly"
+    open-pull-requests-limit: 0
