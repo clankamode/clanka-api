@@ -6,23 +6,45 @@ Edge control API behind Clanka's public presence surface and fleet metadata. Run
 
 | Route | Auth | Method | 2xx | 4xx/5xx | Notes |
 |-------|------|--------|-----|---------|-------|
-| `/` | None | `GET` | — | `404`, `429` | Root path is currently not mapped to a handler in this worker. |
+| `/` | None | `GET` | — | `404`, `429` | Not mapped — do not treat as a health probe. |
+| `/status` | None | `GET` | `200` | `405`, `429` | Service contract: `{ ok, version, timestamp, endpoints }`. Not liveness. |
+| `/health` | None | `GET` | `200` | `405`, `429` | Liveness from heartbeat (`operational` / `offline`). |
+| `/status/uptime` | None | `GET` | `200` | `405`, `429` | Uptime + `last_seen`; `offline` when heartbeat is stale/missing. |
 | `/now` | None | `GET` | `200` | `405`, `429` | Full sync payload (presence, team, history, uptime). |
-| `/status` | None | `GET` | `200` | `405`, `429` | Public status contract (`ok`, `version`, endpoint list). |
+| `/pulse` | None | `GET` | `200` | `405`, `429` | Compact presence pulse for the public surface. |
 | `/tools` | None | `GET` | `200` | `405`, `429` | Registry-derived tools list with `cached` + `count`. |
-| `/changelog` | None | `GET` | `200` | `405`, `429` | Returns commits; may return empty commits with `error` when token is absent. |
+| `/tools/search` | None | `GET` | `200` | `400`, `405`, `429` | Requires `?q=`. |
+| `/tools/:repo` | None | `GET` | `200` | `404`, `405`, `429` | Single registry tool by repo name. |
+| `/projects` | None | `GET` | `200` | `405`, `429` | Core/critical registry projects. |
+| `/tasks` | None | `GET` | `200` | `405`, `429` | Parsed open checkboxes from each repo `TASKS.md`. |
+| `/changelog` | None | `GET` | `200` | `405`, `429` | Commits from `meta-runner`; empty + `error: "no token"` without `GITHUB_TOKEN`. |
 | `/fleet/summary` | None | `GET` | `200` | `405`, `429` | Fleet grouping by tier and criticality from registry data. |
 | `/fleet/health` | None | `GET` | `200` | `503`, `405`, `429` | Fleet CI health from cache/GitHub (503 when unavailable and uncached). |
+| `/fleet/score` | None | `GET` | `200` | `405`, `429` | Aggregate fleet health score. |
+| `/fleet/trend` | None | `GET` | `200` | `405`, `429` | Per-repo CI conclusion trend. |
 | `/history` | None | `GET` | `200` | `405`, `429` | Activity history, supports `?limit=` (max 20), returns `{ history, count }`. |
-| `/metrics` | `X-Admin-Token` | `GET` | `200` | `401`, `503`, `405` | Admin metrics endpoint; no-store response headers. |
+| `/github/stats` | None | `GET` | `200` | `405`, `429` | Org repo/star aggregates (may include `error` when GitHub is unreachable). |
+| `/github/events` | None | `GET` | `200` | `405`, `429` | Recent public GitHub events. |
+| `/posts/count` | None | `GET` | `200` | `405`, `429` | Blog post count from `clankamode.github.io` posts dir. |
+| `/openapi.json` | None | `GET` | `200` | `405`, `429` | OpenAPI 3 document for documented routes. |
+| `/metrics` | `X-Admin-Token: <ADMIN_TOKEN>` | `GET` | `200` | `401`, `503`, `405` | Admin metrics; no-store. Uses `ADMIN_TOKEN`, not Bearer. |
 | `/heartbeat` | `Authorization: Bearer <ADMIN_KEY>` | `POST` | `200` | `400`, `401` | Heartbeat ping with optional history batch payload. |
-| `/set-presence` | `Authorization: Bearer <ADMIN_KEY>` | `POST` | `200` | `400`, `401` | Updates presence/team/activity and `last_seen`. |
+| `/set-presence` | `Authorization: Bearer <ADMIN_KEY>` | `POST` | `200` | `400`, `401` | Updates presence/team/activity objects and `last_seen`. |
 | `/admin/activity` | `Authorization: Bearer <ADMIN_KEY>` | `POST` | `200` | `400`, `401`, `405` | Appends normalized activity entries into `/history`. |
+| `/admin/tasks` | `Authorization: Bearer <ADMIN_KEY>` | `GET/POST/PUT/DELETE` | `200` | `401`, `405` | KV-backed task CRUD. |
+| `/admin/refresh` | `ADMIN_TOKEN: <ADMIN_TOKEN>` | `POST` | `200` | `401`, `503`, `405` | Invalidates registry/CI caches. Header name is literally `ADMIN_TOKEN`. |
 
 ## Stack
 - Cloudflare Workers + KV (`CLANKA_STATE`)
 - TypeScript
 - Wrangler
+
+## Secrets
+| Secret | Used by |
+|--------|---------|
+| `ADMIN_KEY` | `Authorization: Bearer` on `/set-presence`, `/heartbeat`, `/admin/*` (except refresh) |
+| `ADMIN_TOKEN` | `X-Admin-Token` on `/metrics`, `ADMIN_TOKEN` header on `/admin/refresh` |
+| `GITHUB_TOKEN` | Private registry + changelog/fleet GitHub calls |
 
 ## Development
 ```bash
@@ -36,23 +58,30 @@ npx wrangler deploy     # deploy to edge
 
 ## Admin API Reference
 
-All admin write endpoints require `Authorization: Bearer <ADMIN_KEY>` (Cloudflare Worker secret).
+Write endpoints below require `Authorization: Bearer <ADMIN_KEY>` (Cloudflare Worker secret `ADMIN_KEY`).
+`/metrics` and `/admin/refresh` use `ADMIN_TOKEN` instead — see those sections.
 
 ### `POST /set-presence`
 
-Updates presence, team, and activity. All three fields are required.
+Updates presence, team, and activity. All three fields are **required objects** (string values are rejected with `400`).
 
 **Request:**
 ```json
-{ "presence": "online", "team": "solo", "activity": "shipping" }
+{
+  "presence": { "state": "active", "message": "shipping" },
+  "team": { "clanka": { "status": "active", "task": "deploy" } },
+  "activity": { "type": "deploy", "desc": "Pushed clanka-api" }
+}
 ```
+
+Optional: `tasks` (stored as-is), `ttl` (presence KV TTL seconds, default `1800`).
 
 **Response `200`:**
 ```json
-{ "success": true, "presence": "online", "team": "solo", "activity": "shipping" }
+{ "success": true }
 ```
 
-**Errors:** `400` if any required field is missing. `401` on auth failure.
+**Errors:** `400` if `presence`, `team`, or `activity` are missing or not objects. `401` on auth failure.
 
 ---
 
@@ -115,8 +144,35 @@ All methods return `401` if `Authorization` header is absent or incorrect.
 
 ### `GET /metrics`
 
-Internal counters and diagnostics. Requires `X-Admin-Token: <ADMIN_KEY>` (not `Authorization`).
+Internal counters and diagnostics. Requires `X-Admin-Token: <ADMIN_TOKEN>` (not `Authorization`, and not `ADMIN_KEY`).
 
-**Response `200`:** `{ "ok": true, "version": "1.0.0", "requests": 142, "errors": 3 }`
+**Response `200`:**
+```json
+{
+  "uptime_ms": 142000,
+  "requests_total": 142,
+  "kv_hits": 80,
+  "kv_misses": 12,
+  "timestamp": "2026-03-01T00:00:00.000Z"
+}
+```
 
-**Errors:** `401` if token is wrong. `503` if KV is unavailable.
+**Errors:** `401` if token is wrong. `503` if `ADMIN_TOKEN` is unset (`metrics_unavailable`).
+
+---
+
+### `POST /admin/refresh`
+
+Invalidates registry and CI cache keys. Requires header `ADMIN_TOKEN: <ADMIN_TOKEN>` (literal header name).
+
+**Response `200`:**
+```json
+{
+  "success": true,
+  "invalidated": 12,
+  "keys": ["registry:v1", "..."],
+  "timestamp": "2026-03-01T00:00:00.000Z"
+}
+```
+
+**Errors:** `401` if token is wrong. `503` if `ADMIN_TOKEN` is unset (`refresh_unavailable`).
