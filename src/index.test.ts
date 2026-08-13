@@ -572,6 +572,8 @@ describe("Malformed cache fallbacks", () => {
       lastPushedAt: null,
       lastPushedRepo: null,
       cachedAt: expect.any(String),
+      available: false,
+      error: "github_unavailable",
     }));
     expect(Number.isNaN(Date.parse(body.cachedAt))).toBe(false);
   });
@@ -650,7 +652,9 @@ describe("GET /github/stats", () => {
       lastPushedAt: "2026-03-02T00:00:00.000Z",
       lastPushedRepo: "beta",
       cachedAt: expect.any(String),
+      available: true,
     }));
+    expect(body).not.toHaveProperty("error");
     expect(putCalls).toEqual(expect.arrayContaining([
       expect.objectContaining({
         key: "github:stats:v1",
@@ -672,7 +676,21 @@ describe("GET /github/stats", () => {
       lastPushedAt: null,
       lastPushedRepo: null,
       cachedAt: expect.any(String),
+      available: false,
+      error: "github_unavailable",
     }));
+  });
+
+  it("marks stats unavailable when both GitHub endpoints return errors", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+
+    const res = await worker.fetch(req("/github/stats"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.available).toBe(false);
+    expect(body.error).toBe("github_unavailable");
+    expect(body.repoCount).toBe(0);
   });
 
   it("returns live stats even when caching the payload fails", async () => {
@@ -703,6 +721,7 @@ describe("GET /github/stats", () => {
       totalStars: 3,
       lastPushedAt: "2026-03-03T00:00:00.000Z",
       lastPushedRepo: "clanka-api",
+      available: true,
     }));
   });
 
@@ -2612,8 +2631,26 @@ describe("GET /posts/count", () => {
       lastPost: "002",
       lastPostDate: "2026-04-09",
       lastPostSlug: "the-telemetry-trap",
+      available: true,
     });
     fetchSpy.mockRestore();
+  });
+
+  it("marks posts unavailable instead of looking like zero posts when GitHub fails", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+
+    const res = await worker.fetch(req("/posts/count"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({
+      count: 0,
+      lastPost: "000",
+      lastPostDate: "",
+      lastPostSlug: "",
+      available: false,
+      error: "github_unavailable",
+    });
   });
 
   it("rejects non-GET with 405", async () => {

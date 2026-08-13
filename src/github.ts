@@ -14,12 +14,18 @@ import type { ChangelogEntry, Env, GithubEvent, GithubStatsPayload, PostsCountPa
 
 const POST_HTML_RE = /^(\d{4}-\d{2}-\d{2})-(.+)\.html$/;
 
-function emptyPostsCount(): PostsCountPayload {
-  return {
+function emptyPostsCount(error?: string): PostsCountPayload {
+  const base: PostsCountPayload = {
     count: 0,
     lastPost: "000",
     lastPostDate: "",
     lastPostSlug: "",
+  };
+  if (!error) return base;
+  return {
+    ...base,
+    available: false,
+    error,
   };
 }
 
@@ -63,12 +69,12 @@ export async function loadPostsCount(env: Env): Promise<PostsCountPayload> {
   try {
     const res = await fetch(BLOG_POSTS_LIST_URL, { headers });
     if (!res.ok) {
-      return emptyPostsCount();
+      return emptyPostsCount("github_unavailable");
     }
 
     const body = await res.json() as unknown;
     if (!Array.isArray(body)) {
-      return emptyPostsCount();
+      return emptyPostsCount("github_unavailable");
     }
 
     const names: string[] = [];
@@ -98,9 +104,12 @@ export async function loadPostsCount(env: Env): Promise<PostsCountPayload> {
     } catch {
       // ignore cache write failures
     }
-    return payload;
+    return {
+      ...payload,
+      available: true,
+    };
   } catch {
-    return emptyPostsCount();
+    return emptyPostsCount("github_unavailable");
   }
 }
 
@@ -216,6 +225,18 @@ export async function loadGithubStats(env: Env): Promise<GithubStatsPayload> {
       fetch("https://api.github.com/users/clankamode/repos?per_page=100&type=owner", { headers: ghHeaders }),
     ]);
 
+    if (!userRes.ok && !reposRes.ok) {
+      return {
+        repoCount: 0,
+        totalStars: 0,
+        lastPushedAt: null,
+        lastPushedRepo: null,
+        cachedAt: new Date().toISOString(),
+        available: false,
+        error: "github_unavailable",
+      };
+    }
+
     type GhRepo = { stargazers_count: number; pushed_at: string; name: string };
     const repos: GhRepo[] = reposRes.ok ? (await reposRes.json() as GhRepo[]) : [];
 
@@ -244,6 +265,7 @@ export async function loadGithubStats(env: Env): Promise<GithubStatsPayload> {
       lastPushedAt,
       lastPushedRepo,
       cachedAt: new Date().toISOString(),
+      available: true,
     };
 
     try {
@@ -259,6 +281,8 @@ export async function loadGithubStats(env: Env): Promise<GithubStatsPayload> {
       lastPushedAt: null,
       lastPushedRepo: null,
       cachedAt: new Date().toISOString(),
+      available: false,
+      error: "github_unavailable",
     };
   }
 }
