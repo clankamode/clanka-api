@@ -5,7 +5,6 @@ import {
   LAST_SEEN_KEY,
   OPENAPI_SPEC,
   STATUS_ENDPOINTS,
-  STATUS_OFFLINE_THRESHOLD_MS,
   startTime,
 } from "./config";
 import {
@@ -41,7 +40,11 @@ import {
   countActiveAgents,
   getStatusPayload,
   getStatusUptimePayload,
+  isOfflineFromLastSeen,
   normalizeHistory,
+  parsePositiveEpochMs,
+  resolveLastSeenMs,
+  resolveStartedMs,
   toHistoryEntry,
 } from "./presence";
 
@@ -488,20 +491,28 @@ export async function handleFetch(
         });
       }
 
-      const [presenceRaw, historyRaw, teamRaw] = await Promise.all([
+      const [presenceRaw, historyRaw, teamRaw, lastSeenRaw] = await Promise.all([
         env.CLANKA_STATE.get("presence"),
         env.CLANKA_STATE.get("history"),
         env.CLANKA_STATE.get("team"),
+        env.CLANKA_STATE.get(LAST_SEEN_KEY),
       ]);
       const presence = safeParseJSON<{ state?: string; timestamp?: number } | null>(presenceRaw, null);
       const history = normalizeHistory(safeParseJSON<unknown[]>(historyRaw || "[]", []));
       const team = safeParseJSON<unknown>(teamRaw || "{}", {});
       const agentsActive = countActiveAgents(team);
+      const lastSeenMs = resolveLastSeenMs(lastSeenRaw, presence?.timestamp);
+      const offline = isOfflineFromLastSeen(lastSeenMs);
+      const status = offline
+        ? "offline"
+        : (typeof presence?.state === "string" && presence.state.trim()
+          ? presence.state.trim()
+          : "unknown");
 
       return respond(
         JSON.stringify({
           ts: new Date().toISOString(),
-          status: presence?.state || "active",
+          status,
           agents_active: agentsActive,
           last_event_desc: history[0]?.desc || null,
         }),
@@ -746,30 +757,35 @@ export async function handleFetch(
       const presence = safeParseJSON<{ state?: string; message?: string; timestamp?: number } | null>(presenceRaw, null);
       const history = normalizeHistory(safeParseJSON<unknown[]>(historyRaw || "[]", []));
       const team = safeParseJSON<unknown>(teamRaw || "{}", {});
-      let started = Number(startedRaw);
-      if (!Number.isFinite(started)) {
-        started = now;
+      const started = resolveStartedMs(startedRaw, now);
+      if (parsePositiveEpochMs(startedRaw) === null) {
         await env.CLANKA_STATE.put("started", String(started));
       }
       const agentsActive = countActiveAgents(team);
-      const lastSeenFromPresence = typeof presence?.timestamp === "number" ? presence.timestamp : NaN;
-      const lastSeenFromHeartbeat = typeof lastSeenRaw === "string" ? Number(lastSeenRaw) : NaN;
-      const lastSeenMs = Number.isFinite(lastSeenFromHeartbeat)
-        ? lastSeenFromHeartbeat
-        : Number.isFinite(lastSeenFromPresence)
-          ? lastSeenFromPresence
-          : now;
-      const isOffline = now - lastSeenMs > STATUS_OFFLINE_THRESHOLD_MS;
+      const lastSeenMs = resolveLastSeenMs(lastSeenRaw, presence?.timestamp);
+      const offline = isOfflineFromLastSeen(lastSeenMs, now);
+      const status = offline
+        ? "offline"
+        : (typeof presence?.state === "string" && presence.state.trim()
+          ? presence.state.trim()
+          : "unknown");
+      const current = offline
+        ? (typeof presence?.message === "string" && presence.message.trim()
+          ? presence.message
+          : "offline")
+        : (typeof presence?.message === "string" && presence.message.trim()
+          ? presence.message
+          : "online");
 
       return respond(JSON.stringify({
-        current: presence?.message || "monitoring workspace and building public signals",
-        status: isOffline ? "offline" : (presence?.state || "active"),
+        current,
+        status,
         signal: "⚡",
         stack: ["Cloudflare Workers", "TypeScript", "Lit"],
         timestamp: lastSeenMs,
         uptime: Math.max(0, now - started),
         agents_active: agentsActive,
-        last_seen: new Date(lastSeenMs).toISOString(),
+        last_seen: lastSeenMs === null ? null : new Date(lastSeenMs).toISOString(),
         history,
         team,
       }), { headers: corsHeaders });
