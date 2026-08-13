@@ -204,7 +204,8 @@ export function registryEntriesToProjects(entries: RegistryEntry[]): Project[] {
       name: e.repo.replace("clankamode/", ""),
       description: e.description ?? `${e.tier} — ${e.criticality} criticality`,
       url: `https://github.com/${e.repo}`,
-      status: "active",
+      // Registry membership ≠ runtime liveness; do not advertise "active".
+      status: "registered",
       last_updated: today,
     }));
 }
