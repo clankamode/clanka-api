@@ -47,16 +47,28 @@ export const RATE_LIMIT_WINDOW_MS = RATE_LIMIT_WINDOW_SEC * 1000;
 export const RATE_LIMIT_MAX_REQUESTS = 10;
 export const METRICS_KEY = "metrics:v1";
 export const API_VERSION = "1.0.0";
+/** Public-facing discovery list for GET /status. Only include routes that exist. */
 export const STATUS_ENDPOINTS = [
-  "/",
-  "/fleet/summary",
+  "/changelog",
   "/fleet/health",
   "/fleet/score",
+  "/fleet/summary",
+  "/fleet/trend",
+  "/github/events",
+  "/github/stats",
+  "/health",
   "/history",
-  "/now",
-  "/status",
-  "/tools/search",
   "/metrics",
+  "/now",
+  "/openapi.json",
+  "/posts/count",
+  "/projects",
+  "/pulse",
+  "/status",
+  "/status/uptime",
+  "/tasks",
+  "/tools",
+  "/tools/search",
 ];
 export const startTime = Date.now();
 
@@ -80,21 +92,26 @@ export const OPENAPI_SPEC = {
   paths: {
     "/status": {
       get: {
-        summary: "Get service status",
+        summary: "Get service status contract and endpoint discovery list",
         responses: {
           "200": {
-            description: "Current status payload",
+            description: "Public status contract (ok/version/endpoints). Liveness is on /health and /status/uptime.",
             content: {
               "application/json": {
                 schema: {
                   type: "object",
                   properties: {
-                    status: { type: "string" },
-                    timestamp: { type: "string" },
-                    signal: { type: "string" },
-                    last_seen: { type: "string" },
+                    ok: { type: "boolean" },
+                    version: { type: "string" },
+                    timestamp: { type: "string", format: "date-time" },
+                    endpoints: {
+                      type: "array",
+                      items: { type: "string" },
+                      description: "Routable paths exposed by this worker (excludes unmapped paths like /)",
+                    },
                   },
-                  additionalProperties: true,
+                  required: ["ok", "version", "timestamp", "endpoints"],
+                  additionalProperties: false,
                 },
               },
             },
