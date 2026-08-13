@@ -13,15 +13,26 @@ const VALID_SET_PRESENCE_PAYLOAD = {
   activity: { type: "SYNC", desc: "presence updated" },
 };
 const STATUS_ENDPOINTS = [
-  "/",
-  "/fleet/summary",
+  "/changelog",
   "/fleet/health",
   "/fleet/score",
+  "/fleet/summary",
+  "/fleet/trend",
+  "/github/events",
+  "/github/stats",
+  "/health",
   "/history",
-  "/now",
-  "/status",
-  "/tools/search",
   "/metrics",
+  "/now",
+  "/openapi.json",
+  "/posts/count",
+  "/projects",
+  "/pulse",
+  "/status",
+  "/status/uptime",
+  "/tasks",
+  "/tools",
+  "/tools/search",
 ];
 
 function createMockKV(store: Record<string, string> = {}): any {
@@ -2120,6 +2131,30 @@ describe("GET /status", () => {
     const body = await json(res);
     expect(body.endpoints).toContain("/status");
     expect(body.endpoints).toContain("/metrics");
+  });
+
+  it("does not advertise unmapped root path as an endpoint", async () => {
+    const res = await worker.fetch(req("/status"), createEnv());
+    const body = await json(res);
+    expect(body.endpoints).not.toContain("/");
+    expect(body.endpoints).toContain("/health");
+    expect(body.endpoints).toContain("/pulse");
+  });
+});
+
+describe("OpenAPI /status contract honesty", () => {
+  it("documents ok/version/endpoints instead of the /health liveness shape", async () => {
+    const res = await worker.fetch(req("/openapi.json"), createEnv());
+    const body = await json(res);
+    const schema = body.paths?.["/status"]?.get?.responses?.["200"]?.content?.["application/json"]?.schema;
+    expect(schema?.properties?.ok).toBeTruthy();
+    expect(schema?.properties?.version).toBeTruthy();
+    expect(schema?.properties?.endpoints).toBeTruthy();
+    expect(schema?.properties?.status).toBeUndefined();
+    expect(schema?.properties?.signal).toBeUndefined();
+    expect(schema?.required).toEqual(
+      expect.arrayContaining(["ok", "version", "timestamp", "endpoints"]),
+    );
   });
 });
 
