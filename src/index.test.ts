@@ -198,6 +198,8 @@ describe("GET /projects", () => {
       expect(p).toHaveProperty("url");
       expect(p).toHaveProperty("status");
       expect(p).toHaveProperty("last_updated");
+      expect(p.status).toBe("registered");
+      expect(p.status).not.toBe("active");
     }
   });
 
