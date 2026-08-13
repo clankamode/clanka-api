@@ -1,10 +1,45 @@
 import { HISTORY_LIMIT, STATUS_OFFLINE_THRESHOLD_MS } from "./config";
 import type { HistoryEntry } from "./types";
 
+/** Parse a positive epoch-ms timestamp; reject missing/zero/invalid values. */
+export function parsePositiveEpochMs(raw: string | null | undefined): number | null {
+  if (typeof raw !== "string" || raw.trim().length === 0) return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return value;
+}
+
+/**
+ * Resolve last-seen from heartbeat KV and optional presence.timestamp.
+ * Returns null when we have no trustworthy signal (do not invent "now").
+ */
+export function resolveLastSeenMs(
+  lastSeenRaw: string | null,
+  presenceTimestamp?: number | null,
+): number | null {
+  const fromHeartbeat = parsePositiveEpochMs(lastSeenRaw);
+  if (fromHeartbeat !== null) return fromHeartbeat;
+  if (typeof presenceTimestamp === "number" && Number.isFinite(presenceTimestamp) && presenceTimestamp > 0) {
+    return presenceTimestamp;
+  }
+  return null;
+}
+
+export function isOfflineFromLastSeen(lastSeenMs: number | null, now = Date.now()): boolean {
+  if (lastSeenMs === null) return true;
+  return now - lastSeenMs > STATUS_OFFLINE_THRESHOLD_MS;
+}
+
+/** Treat missing/zero started as "start now" so uptime is not epoch-sized. */
+export function resolveStartedMs(startedRaw: string | null, now = Date.now()): number {
+  const started = parsePositiveEpochMs(startedRaw);
+  return started ?? now;
+}
+
 export function getStatusPayload(lastSeenRaw: string | null) {
-  const lastSeen = typeof lastSeenRaw === "string" ? Number(lastSeenRaw) : NaN;
+  const lastSeen = parsePositiveEpochMs(lastSeenRaw);
   const now = Date.now();
-  if (!Number.isFinite(lastSeen) || now - lastSeen > STATUS_OFFLINE_THRESHOLD_MS) {
+  if (lastSeen === null || now - lastSeen > STATUS_OFFLINE_THRESHOLD_MS) {
     return { status: "offline" };
   }
 
@@ -17,9 +52,9 @@ export function getStatusPayload(lastSeenRaw: string | null) {
 }
 
 export function getStatusUptimePayload(lastSeenRaw: string | null) {
-  const lastSeen = typeof lastSeenRaw === "string" ? Number(lastSeenRaw) : NaN;
+  const lastSeen = parsePositiveEpochMs(lastSeenRaw);
   const now = Date.now();
-  if (!Number.isFinite(lastSeen) || now - lastSeen > STATUS_OFFLINE_THRESHOLD_MS) {
+  if (lastSeen === null || now - lastSeen > STATUS_OFFLINE_THRESHOLD_MS) {
     return {
       status: "offline",
       uptime_ms: 0,

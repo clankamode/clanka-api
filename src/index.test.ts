@@ -2015,16 +2015,55 @@ describe("GET /now and GET /pulse contracts", () => {
     expect(body.signal).toBe("⚡");
   });
 
+  it("returns offline in /now when heartbeat was never recorded", async () => {
+    const now = 1_750_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+
+    const res = await worker.fetch(req("/now"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("offline");
+    expect(body.last_seen).toBeNull();
+    expect(body.timestamp).toBeNull();
+    expect(body.current).toBe("offline");
+    expect(body.uptime).toBe(0);
+  });
+
+  it("does not invent epoch-sized uptime when started is zero", async () => {
+    const now = 1_750_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+
+    const res = await worker.fetch(
+      req("/now"),
+      createEnv({
+        started: "0",
+        last_seen: String(now - 1_000),
+        presence: JSON.stringify({ state: "active", message: "shipping", timestamp: now - 1_000 }),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("active");
+    expect(body.uptime).toBe(0);
+    expect(body.uptime).toBeLessThan(60_000);
+  });
+
   it("rejects non-GET /now with 405", async () => {
     const res = await worker.fetch(req("/now", "POST"), createEnv());
     expect(res.status).toBe(405);
   });
 
   it("returns deterministic /pulse payload shape", async () => {
+    const now = 1_750_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+
     const res = await worker.fetch(
       req("/pulse"),
       createEnv({
-        presence: JSON.stringify({ state: "active" }),
+        last_seen: String(now - 1_000),
+        presence: JSON.stringify({ state: "active", timestamp: now - 1_000 }),
         team: JSON.stringify({ clanka: { status: "active" }, helper: { status: "idle" } }),
         history: JSON.stringify([{ type: "SYNC", desc: "deployed", timestamp: 12345, hash: "aaa" }]),
       }),
@@ -2038,6 +2077,15 @@ describe("GET /now and GET /pulse contracts", () => {
       agents_active: 1,
       last_event_desc: "deployed",
     }));
+  });
+
+  it("returns offline in /pulse when presence and heartbeat are missing", async () => {
+    const res = await worker.fetch(req("/pulse"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("offline");
+    expect(body.status).not.toBe("active");
   });
 });
 
