@@ -95,6 +95,9 @@ export type GithubStatsPayload = {
   lastPushedAt: string | null;
   lastPushedRepo: string | null;
   cachedAt: string;
+  /** False when the payload is a failure placeholder, not a real empty org. */
+  available?: boolean;
+  error?: string;
 };
 
 export type GithubEvent = {
@@ -109,4 +112,7 @@ export type PostsCountPayload = {
   lastPost: string;
   lastPostDate: string;
   lastPostSlug: string;
+  /** False when the payload is a failure placeholder, not a real empty posts dir. */
+  available?: boolean;
+  error?: string;
 };
