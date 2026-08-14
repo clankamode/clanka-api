@@ -26,11 +26,11 @@ describe("loadGithubEvents", () => {
       },
     ];
 
-    const events = await loadGithubEvents(createMockKV({
+    const payload = await loadGithubEvents(createMockKV({
       "github:events:v1": JSON.stringify(cached),
     }));
 
-    expect(events).toEqual(cached);
+    expect(payload).toEqual({ events: cached, available: true });
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -44,7 +44,7 @@ describe("loadGithubEvents", () => {
       },
     ]), { status: 200 }));
 
-    const events = await loadGithubEvents(createMockKV({
+    const { events } = await loadGithubEvents(createMockKV({
       "github:events:v1": "{invalid-json",
     }));
 
@@ -53,20 +53,28 @@ describe("loadGithubEvents", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("returns [] when GitHub response is non-ok", async () => {
+  it("marks events unavailable when GitHub response is non-ok", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
 
-    const events = await loadGithubEvents(createMockKV());
+    const payload = await loadGithubEvents(createMockKV());
 
-    expect(events).toEqual([]);
+    expect(payload).toEqual({
+      events: [],
+      available: false,
+      error: "github_unavailable",
+    });
   });
 
-  it("returns [] when the GitHub request throws", async () => {
+  it("marks events unavailable when the GitHub request throws", async () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network down"));
 
-    const events = await loadGithubEvents(createMockKV());
+    const payload = await loadGithubEvents(createMockKV());
 
-    expect(events).toEqual([]);
+    expect(payload).toEqual({
+      events: [],
+      available: false,
+      error: "github_unavailable",
+    });
   });
 
   it("returns fetched events even when writing the cache fails", async () => {
@@ -84,16 +92,19 @@ describe("loadGithubEvents", () => {
       put: async () => { throw new Error("kv unavailable"); },
     } as KVNamespace;
 
-    const events = await loadGithubEvents(kv);
+    const payload = await loadGithubEvents(kv);
 
-    expect(events).toEqual([
-      {
-        type: "PUSH",
-        repo: "clanka-api",
-        message: "fresh message",
-        timestamp: "2026-03-01T00:00:00.000Z",
-      },
-    ]);
+    expect(payload).toEqual({
+      events: [
+        {
+          type: "PUSH",
+          repo: "clanka-api",
+          message: "fresh message",
+          timestamp: "2026-03-01T00:00:00.000Z",
+        },
+      ],
+      available: true,
+    });
   });
 
   it("normalizes repo names by removing clankamode/ prefix", async () => {
@@ -108,7 +119,7 @@ describe("loadGithubEvents", () => {
       },
     ]), { status: 200 }));
 
-    const events = await loadGithubEvents(createMockKV());
+    const { events } = await loadGithubEvents(createMockKV());
 
     expect(events).toHaveLength(1);
     expect(events[0].repo).toBe("clanka-api");
@@ -126,7 +137,7 @@ describe("loadGithubEvents", () => {
       },
     ]), { status: 200 }));
 
-    const events = await loadGithubEvents(createMockKV());
+    const { events } = await loadGithubEvents(createMockKV());
 
     expect(events).toHaveLength(1);
     expect(events[0].message.length).toBeLessThanOrEqual(100);
@@ -145,7 +156,7 @@ describe("loadGithubEvents", () => {
       },
     ]), { status: 200 }));
 
-    const events = await loadGithubEvents(createMockKV());
+    const { events } = await loadGithubEvents(createMockKV());
 
     expect(events[0]).toEqual({
       type: "PUSH",
@@ -168,7 +179,7 @@ describe("loadGithubEvents", () => {
       },
     ]), { status: 200 }));
 
-    const events = await loadGithubEvents(createMockKV());
+    const { events } = await loadGithubEvents(createMockKV());
 
     expect(events[0]).toEqual(expect.objectContaining({
       type: "PR",
@@ -189,7 +200,7 @@ describe("loadGithubEvents", () => {
       },
     ]), { status: 200 }));
 
-    const events = await loadGithubEvents(createMockKV());
+    const { events } = await loadGithubEvents(createMockKV());
 
     expect(events[0]).toEqual(expect.objectContaining({
       type: "ISSUE",
@@ -210,7 +221,7 @@ describe("loadGithubEvents", () => {
       },
     ]), { status: 200 }));
 
-    const events = await loadGithubEvents(createMockKV());
+    const { events } = await loadGithubEvents(createMockKV());
 
     expect(events[0]).toEqual(expect.objectContaining({
       type: "CREATE",
@@ -234,7 +245,7 @@ describe("loadGithubEvents", () => {
       },
     ]), { status: 200 }));
 
-    const events = await loadGithubEvents(createMockKV());
+    const { events } = await loadGithubEvents(createMockKV());
 
     expect(events).toHaveLength(1);
     expect(events[0].type).toBe("PUSH");
@@ -249,7 +260,7 @@ describe("loadGithubEvents", () => {
     }));
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify(raw), { status: 200 }));
 
-    const events = await loadGithubEvents(createMockKV());
+    const { events } = await loadGithubEvents(createMockKV());
 
     expect(events).toHaveLength(15);
     expect(events[0].message).toBe("commit-0");
@@ -266,7 +277,7 @@ describe("loadGithubEvents", () => {
       },
     ]), { status: 200 }));
 
-    const events = await loadGithubEvents(createMockKV());
+    const { events } = await loadGithubEvents(createMockKV());
 
     expect(events).toHaveLength(1);
     expect(events[0].message).toBe("push");
@@ -282,7 +293,7 @@ describe("loadGithubEvents", () => {
       },
     ]), { status: 200 }));
 
-    const events = await loadGithubEvents(createMockKV());
+    const { events } = await loadGithubEvents(createMockKV());
 
     expect(events).toHaveLength(1);
     expect(events[0].repo).toBe("otherorg/external-repo");
@@ -301,7 +312,7 @@ describe("loadGithubEvents", () => {
       },
     ]), { status: 200 }));
 
-    const events = await loadGithubEvents(createMockKV());
+    const { events } = await loadGithubEvents(createMockKV());
 
     expect(events[0].message.length).toBeLessThanOrEqual(100);
     expect(events[0].message.endsWith("...")).toBe(true);
@@ -321,7 +332,7 @@ describe("loadGithubEvents", () => {
       },
     ]), { status: 200 }));
 
-    const events = await loadGithubEvents(createMockKV());
+    const { events } = await loadGithubEvents(createMockKV());
 
     expect(events[0].message.length).toBeLessThanOrEqual(100);
     expect(events[0].message.endsWith("...")).toBe(true);
@@ -341,7 +352,7 @@ describe("loadGithubEvents", () => {
       },
     ]), { status: 200 }));
 
-    const events = await loadGithubEvents(createMockKV());
+    const { events } = await loadGithubEvents(createMockKV());
 
     expect(events[0].message.length).toBeLessThanOrEqual(100);
     expect(events[0].message.endsWith("...")).toBe(true);
@@ -362,7 +373,7 @@ describe("loadGithubEvents", () => {
       },
     ]), { status: 200 }));
 
-    const events = await loadGithubEvents(kv);
+    const { events } = await loadGithubEvents(kv);
 
     expect(events).toHaveLength(1);
     expect(putSpy).toHaveBeenCalledWith(

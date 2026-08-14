@@ -17,14 +17,14 @@ Edge control API behind Clanka's public presence surface and fleet metadata. Run
 | `/tools/:repo` | None | `GET` | `200` | `404`, `405`, `429` | Single registry tool by repo name. |
 | `/projects` | None | `GET` | `200` | `405`, `429` | Core/critical registry projects. |
 | `/tasks` | None | `GET` | `200` | `405`, `429` | Parsed open checkboxes from each repo `TASKS.md`. |
-| `/changelog` | None | `GET` | `200` | `405`, `429` | Commits from `meta-runner`; empty + `error: "no token"` without `GITHUB_TOKEN`. |
+| `/changelog` | None | `GET` | `200` | `405`, `429` | Commits from `meta-runner`; `available: false` + `error` when token missing or GitHub unreachable. |
 | `/fleet/summary` | None | `GET` | `200` | `405`, `429` | Fleet grouping by tier and criticality from registry data. |
 | `/fleet/health` | None | `GET` | `200` | `503`, `405`, `429` | Fleet CI health from cache/GitHub (503 when unavailable and uncached). |
 | `/fleet/score` | None | `GET` | `200` | `405`, `429` | Aggregate fleet health score. |
 | `/fleet/trend` | None | `GET` | `200` | `405`, `429` | Per-repo CI conclusion trend. |
 | `/history` | None | `GET` | `200` | `405`, `429` | Activity history, supports `?limit=` (max 20), returns `{ history, count }`. |
-| `/github/stats` | None | `GET` | `200` | `405`, `429` | Org repo/star aggregates (may include `error` when GitHub is unreachable). |
-| `/github/events` | None | `GET` | `200` | `405`, `429` | Recent public GitHub events. |
+| `/github/stats` | None | `GET` | `200` | `405`, `429` | Org repo/star aggregates (`available: false` when GitHub is unreachable). |
+| `/github/events` | None | `GET` | `200` | `405`, `429` | Recent public GitHub events (`available: false` when GitHub is unreachable). |
 | `/posts/count` | None | `GET` | `200` | `405`, `429` | Blog post count from `clankamode.github.io` posts dir. |
 | `/openapi.json` | None | `GET` | `200` | `405`, `429` | OpenAPI 3 document for documented routes. |
 | `/metrics` | `X-Admin-Token: <ADMIN_TOKEN>` | `GET` | `200` | `401`, `503`, `405` | Admin metrics; no-store. Uses `ADMIN_TOKEN`, not Bearer. |

@@ -807,8 +807,8 @@ export async function handleFetch(
       if (request.method !== "GET") {
         return respond(JSON.stringify({ error: "Method Not Allowed" }), { status: 405, headers: corsHeaders });
       }
-      const events = await loadGithubEvents(env.CLANKA_STATE);
-      return respond(JSON.stringify({ events }), { headers: corsHeaders });
+      const eventsPayload = await loadGithubEvents(env.CLANKA_STATE);
+      return respond(JSON.stringify(eventsPayload), { headers: corsHeaders });
     }
 
     if (url.pathname === "/changelog") {
@@ -823,14 +823,17 @@ export async function handleFetch(
       if (!token) {
         return respond(JSON.stringify({
           commits: [],
+          available: false,
           error: "no token",
           timestamp: new Date().toISOString(),
         }), { headers: corsHeaders });
       }
 
-      const commits = await loadChangelog(env);
+      const changelog = await loadChangelog(env);
       return respond(JSON.stringify({
-        commits,
+        commits: changelog.commits,
+        available: changelog.available !== false,
+        ...(changelog.error ? { error: changelog.error } : {}),
         timestamp: new Date().toISOString(),
       }), { headers: corsHeaders });
     }

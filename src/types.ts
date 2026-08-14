@@ -59,6 +59,13 @@ export type ChangelogEntry = {
   date: string;
 };
 
+export type ChangelogPayload = {
+  commits: ChangelogEntry[];
+  /** False when the payload is a failure placeholder, not a real empty changelog. */
+  available?: boolean;
+  error?: string;
+};
+
 export type RegistryEntry = {
   repo: string;
   criticality: FleetCriticality;
@@ -105,6 +112,13 @@ export type GithubEvent = {
   repo: string;
   message: string;
   timestamp: string;
+};
+
+export type GithubEventsPayload = {
+  events: GithubEvent[];
+  /** False when the payload is a failure placeholder, not a real empty feed. */
+  available?: boolean;
+  error?: string;
 };
 
 export type PostsCountPayload = {
