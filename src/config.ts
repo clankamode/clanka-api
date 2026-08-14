@@ -162,7 +162,7 @@ export const OPENAPI_SPEC = {
     },
     "/projects": {
       get: {
-        summary: "Get active projects from registry",
+        summary: "Get registered projects from registry",
         responses: {
           "200": {
             description: "Projects payload",
@@ -430,6 +430,7 @@ export const OPENAPI_SPEC = {
                       },
                     },
                     timestamp: { type: "string" },
+                    available: { type: "boolean" },
                     error: { type: "string" },
                   },
                   required: ["commits", "timestamp"],

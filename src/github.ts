@@ -10,7 +10,15 @@ import {
   GITHUB_STATS_CACHE_KEY,
   GITHUB_STATS_TTL_SEC,
 } from "./config";
-import type { ChangelogEntry, Env, GithubEvent, GithubStatsPayload, PostsCountPayload } from "./types";
+import type {
+  ChangelogEntry,
+  ChangelogPayload,
+  Env,
+  GithubEvent,
+  GithubEventsPayload,
+  GithubStatsPayload,
+  PostsCountPayload,
+} from "./types";
 
 const POST_HTML_RE = /^(\d{4}-\d{2}-\d{2})-(.+)\.html$/;
 
@@ -179,9 +187,19 @@ function parseChangelogEntries(raw: string | null): ChangelogEntry[] | null {
   }
 }
 
-export async function loadChangelog(env: Env): Promise<ChangelogEntry[]> {
+function unavailableChangelog(error: string): ChangelogPayload {
+  return {
+    commits: [],
+    available: false,
+    error,
+  };
+}
+
+export async function loadChangelog(env: Env): Promise<ChangelogPayload> {
   const cached = parseChangelogEntries(await env.CLANKA_STATE.get(CHANGELOG_CACHE_KEY));
-  if (cached !== null) return cached;
+  if (cached !== null) {
+    return { commits: cached, available: true };
+  }
 
   const headers: Record<string, string> = {
     "User-Agent": "clanka-api/1.0",
@@ -189,21 +207,25 @@ export async function loadChangelog(env: Env): Promise<ChangelogEntry[]> {
   };
   if (env.GITHUB_TOKEN) headers["Authorization"] = `Bearer ${env.GITHUB_TOKEN}`;
 
-  const res = await fetch(CHANGELOG_URL, { headers });
-  if (!res.ok) return [];
+  try {
+    const res = await fetch(CHANGELOG_URL, { headers });
+    if (!res.ok) return unavailableChangelog("github_unavailable");
 
-  const body = await res.json() as unknown;
-  if (!Array.isArray(body)) return [];
+    const body = await res.json() as unknown;
+    if (!Array.isArray(body)) return unavailableChangelog("github_unavailable");
 
-  const payload = body
-    .slice(0, 10)
-    .map((entry) => normalizeChangelogEntry(entry))
-    .filter((entry): entry is ChangelogEntry => Boolean(entry));
+    const commits = body
+      .slice(0, 10)
+      .map((entry) => normalizeChangelogEntry(entry))
+      .filter((entry): entry is ChangelogEntry => Boolean(entry));
 
-  await env.CLANKA_STATE.put(CHANGELOG_CACHE_KEY, JSON.stringify(payload), {
-    expirationTtl: CHANGELOG_TTL_SEC,
-  });
-  return payload;
+    await env.CLANKA_STATE.put(CHANGELOG_CACHE_KEY, JSON.stringify(commits), {
+      expirationTtl: CHANGELOG_TTL_SEC,
+    });
+    return { commits, available: true };
+  } catch {
+    return unavailableChangelog("github_unavailable");
+  }
 }
 
 export async function loadGithubStats(env: Env): Promise<GithubStatsPayload> {
@@ -309,19 +331,34 @@ function truncateMessage(message: string, maxLen = MESSAGE_MAX_LEN): string {
   return `${message.slice(0, maxLen - 3)}...`;
 }
 
-export async function loadGithubEvents(kv: KVNamespace): Promise<GithubEvent[]> {
+function unavailableEvents(error: string): GithubEventsPayload {
+  return {
+    events: [],
+    available: false,
+    error,
+  };
+}
+
+export async function loadGithubEvents(kv: KVNamespace): Promise<GithubEventsPayload> {
   const cached = await kv.get(GITHUB_EVENTS_CACHE_KEY);
   if (cached) {
-    try { return JSON.parse(cached) as GithubEvent[]; } catch { /* fall through */ }
+    try {
+      const events = JSON.parse(cached) as GithubEvent[];
+      if (Array.isArray(events)) {
+        return { events, available: true };
+      }
+    } catch { /* fall through */ }
   }
 
   try {
     const res = await fetch("https://api.github.com/users/clankamode/events?per_page=30", {
       headers: { "User-Agent": "clanka-api/1.0", "Accept": "application/vnd.github.v3+json" },
     });
-    if (!res.ok) return [];
+    if (!res.ok) return unavailableEvents("github_unavailable");
 
     const raw = (await res.json()) as GhEvent[];
+    if (!Array.isArray(raw)) return unavailableEvents("github_unavailable");
+
     const allowed = new Set(["PushEvent", "CreateEvent", "PullRequestEvent", "IssuesEvent"]);
     const events: GithubEvent[] = [];
 
@@ -357,8 +394,8 @@ export async function loadGithubEvents(kv: KVNamespace): Promise<GithubEvent[]> 
     } catch {
       // ignore cache write failures and still serve fresh data
     }
-    return events;
+    return { events, available: true };
   } catch {
-    return [];
+    return unavailableEvents("github_unavailable");
   }
 }

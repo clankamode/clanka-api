@@ -580,7 +580,7 @@ describe("Malformed cache fallbacks", () => {
     expect(Number.isNaN(Date.parse(body.cachedAt))).toBe(false);
   });
 
-  it("returns { events: [] } when github:events:v1 cache JSON is malformed", async () => {
+  it("marks events unavailable when github:events:v1 cache JSON is malformed and GitHub fails", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
 
     const res = await worker.fetch(
@@ -590,7 +590,11 @@ describe("Malformed cache fallbacks", () => {
     const body = await json(res);
 
     expect(res.status).toBe(200);
-    expect(body).toEqual({ events: [] });
+    expect(body).toEqual({
+      events: [],
+      available: false,
+      error: "github_unavailable",
+    });
   });
 });
 
@@ -752,18 +756,49 @@ describe("GET /github/events", () => {
     const body = await json(res);
 
     expect(res.status).toBe(200);
-    expect(body).toEqual({ events: cached });
+    expect(body).toEqual({ events: cached, available: true });
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("returns an empty events array when GitHub fetch throws", async () => {
+  it("marks events unavailable instead of looking empty when GitHub fetch throws", async () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network down"));
 
     const res = await worker.fetch(req("/github/events"), createEnv());
     const body = await json(res);
 
     expect(res.status).toBe(200);
-    expect(body).toEqual({ events: [] });
+    expect(body).toEqual({
+      events: [],
+      available: false,
+      error: "github_unavailable",
+    });
+  });
+
+  it("marks events unavailable when GitHub returns a non-ok status", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+
+    const res = await worker.fetch(req("/github/events"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({
+      events: [],
+      available: false,
+      error: "github_unavailable",
+    });
+  });
+
+  it("marks a genuine empty feed as available", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    const res = await worker.fetch(req("/github/events"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({
+      events: [],
+      available: true,
+    });
   });
 
   it("rejects non-GET with 405", async () => {
@@ -916,8 +951,10 @@ describe("GET /changelog", () => {
     expect(res.status).toBe(200);
     expect(body).toEqual(expect.objectContaining({
       commits: expect.any(Array),
+      available: true,
       timestamp: expect.any(String),
     }));
+    expect(body).not.toHaveProperty("error");
     expect(body.commits[0]).toEqual(expect.objectContaining({
       sha: "abc123",
       message: "feat: add pipeline",
@@ -1003,20 +1040,37 @@ describe("GET /changelog", () => {
     expect(res.status).toBe(200);
     expect(body).toEqual(expect.objectContaining({
       commits: [],
+      available: false,
       error: "no token",
       timestamp: expect.any(String),
     }));
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("returns empty commits when GitHub request fails", async () => {
+  it("marks changelog unavailable instead of looking empty when GitHub request fails", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
     const res = await worker.fetch(req("/changelog"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
     const body = await json(res);
     expect(res.status).toBe(200);
-    expect(body.commits).toEqual([]);
+    expect(body).toEqual(expect.objectContaining({
+      commits: [],
+      available: false,
+      error: "github_unavailable",
+      timestamp: expect.any(String),
+    }));
+  });
+
+  it("marks a genuine empty changelog as available", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+    const res = await worker.fetch(req("/changelog"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      commits: [],
+      available: true,
+      timestamp: expect.any(String),
+    }));
     expect(body).not.toHaveProperty("error");
-    expect(body).toHaveProperty("timestamp");
   });
 
   it("limits changelog response to 10 commits", async () => {
