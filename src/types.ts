@@ -75,7 +75,13 @@ export type RegistryEntry = {
 
 export type TaskPriority = "red" | "yellow" | "green";
 export type RepoTask = { priority: TaskPriority; text: string; done: boolean };
-export type RepoTasksPayload = { repo: string; tasks: RepoTask[] };
+export type RepoTasksPayload = {
+  repo: string;
+  tasks: RepoTask[];
+  /** False when TASKS.md could not be fetched, not a genuine empty file. */
+  available?: boolean;
+  error?: string;
+};
 export type RateLimitState = {
   count: number;
   resetAt: number;

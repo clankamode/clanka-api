@@ -228,6 +228,18 @@ export async function loadChangelog(env: Env): Promise<ChangelogPayload> {
   }
 }
 
+function unavailableGithubStats(): GithubStatsPayload {
+  return {
+    repoCount: 0,
+    totalStars: 0,
+    lastPushedAt: null,
+    lastPushedRepo: null,
+    cachedAt: new Date().toISOString(),
+    available: false,
+    error: "github_unavailable",
+  };
+}
+
 export async function loadGithubStats(env: Env): Promise<GithubStatsPayload> {
   const cached = await env.CLANKA_STATE.get(GITHUB_STATS_CACHE_KEY);
   if (cached) {
@@ -247,20 +259,17 @@ export async function loadGithubStats(env: Env): Promise<GithubStatsPayload> {
       fetch("https://api.github.com/users/clankamode/repos?per_page=100&type=owner", { headers: ghHeaders }),
     ]);
 
-    if (!userRes.ok && !reposRes.ok) {
-      return {
-        repoCount: 0,
-        totalStars: 0,
-        lastPushedAt: null,
-        lastPushedRepo: null,
-        cachedAt: new Date().toISOString(),
-        available: false,
-        error: "github_unavailable",
-      };
+    // Stars and last-push come only from the repos listing. A failed repos
+    // fetch must not look like a real empty org (0 stars / never pushed).
+    if (!reposRes.ok) {
+      return unavailableGithubStats();
     }
 
     type GhRepo = { stargazers_count: number; pushed_at: string; name: string };
-    const repos: GhRepo[] = reposRes.ok ? (await reposRes.json() as GhRepo[]) : [];
+    const repos: GhRepo[] = await reposRes.json() as GhRepo[];
+    if (!Array.isArray(repos)) {
+      return unavailableGithubStats();
+    }
 
     let repoCount = 0;
     if (userRes.ok) {
@@ -297,15 +306,7 @@ export async function loadGithubStats(env: Env): Promise<GithubStatsPayload> {
     }
     return payload;
   } catch {
-    return {
-      repoCount: 0,
-      totalStars: 0,
-      lastPushedAt: null,
-      lastPushedRepo: null,
-      cachedAt: new Date().toISOString(),
-      available: false,
-      error: "github_unavailable",
-    };
+    return unavailableGithubStats();
   }
 }
 

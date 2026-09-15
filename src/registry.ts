@@ -85,9 +85,9 @@ function parseRegistryEntries(raw: string | null): RegistryEntry[] | null {
   }
 }
 
-export async function loadRegistryEntries(env: Env): Promise<RegistryEntry[]> {
+export async function loadRegistrySource(env: Env): Promise<{ entries: RegistryEntry[]; cached: boolean }> {
   const cachedEntries = parseRegistryEntries(await env.CLANKA_STATE.get(REGISTRY_CACHE_KEY));
-  if (cachedEntries !== null) return cachedEntries;
+  if (cachedEntries !== null) return { entries: cachedEntries, cached: true };
 
   const staleEntries = parseRegistryEntries(await env.CLANKA_STATE.get(REGISTRY_STALE_CACHE_KEY));
 
@@ -99,9 +99,11 @@ export async function loadRegistryEntries(env: Env): Promise<RegistryEntry[]> {
     if (env.GITHUB_TOKEN) headers["Authorization"] = `Bearer ${env.GITHUB_TOKEN}`;
 
     const res = await fetch(REGISTRY_URL, { headers });
-    if (!res.ok) return staleEntries ?? [];
+    if (!res.ok) return { entries: staleEntries ?? [], cached: false };
     const meta = await res.json() as { content?: string };
-    if (typeof meta.content !== "string" || meta.content.length === 0) return staleEntries ?? [];
+    if (typeof meta.content !== "string" || meta.content.length === 0) {
+      return { entries: staleEntries ?? [], cached: false };
+    }
     const json = decodeBase64(meta.content);
     const entries = extractRegistryEntries(JSON.parse(json) as unknown);
     await Promise.all([
@@ -112,10 +114,14 @@ export async function loadRegistryEntries(env: Env): Promise<RegistryEntry[]> {
         expirationTtl: REGISTRY_STALE_TTL_SEC,
       }),
     ]);
-    return entries;
+    return { entries, cached: false };
   } catch {
-    return staleEntries ?? [];
+    return { entries: staleEntries ?? [], cached: false };
   }
+}
+
+export async function loadRegistryEntries(env: Env): Promise<RegistryEntry[]> {
+  return (await loadRegistrySource(env)).entries;
 }
 
 export async function loadToolsRegistryEntries(env: Env): Promise<{ entries: RegistryEntry[]; cached: boolean }> {

@@ -10,20 +10,20 @@ Edge control API behind Clanka's public presence surface and fleet metadata. Run
 | `/status` | None | `GET` | `200` | `405`, `429` | Service contract: `{ ok, version, timestamp, endpoints }`. Not liveness. |
 | `/health` | None | `GET` | `200` | `405`, `429` | Liveness from heartbeat (`operational` / `offline`). |
 | `/status/uptime` | None | `GET` | `200` | `405`, `429` | Uptime + `last_seen`; `offline` when heartbeat is stale/missing. |
-| `/now` | None | `GET` | `200` | `405`, `429` | Full sync payload (presence, team, history, uptime). |
+| `/now` | None | `GET` | `200` | `405`, `429` | Full sync payload. `current` is the presence message, or `status` when the message is missing — never a synthetic `"online"`. |
 | `/pulse` | None | `GET` | `200` | `405`, `429` | Compact presence pulse for the public surface. |
 | `/tools` | None | `GET` | `200` | `405`, `429` | Registry-derived tools list with `cached` + `count`. |
 | `/tools/search` | None | `GET` | `200` | `400`, `405`, `429` | Requires `?q=`. |
 | `/tools/:repo` | None | `GET` | `200` | `404`, `405`, `429` | Single registry tool by repo name. |
-| `/projects` | None | `GET` | `200` | `405`, `429` | Core/critical registry projects. |
-| `/tasks` | None | `GET` | `200` | `405`, `429` | Parsed open checkboxes from each repo `TASKS.md`. |
+| `/projects` | None | `GET` | `200` | `405`, `429` | Core/critical registry projects. `cached` is true only on a KV hit. |
+| `/tasks` | None | `GET` | `200` | `405`, `429` | Parsed open checkboxes from each repo `TASKS.md`. Per-repo `available: false` when GitHub is unreachable (not a missing file). |
 | `/changelog` | None | `GET` | `200` | `405`, `429` | Commits from `meta-runner`; `available: false` + `error` when token missing or GitHub unreachable. |
 | `/fleet/summary` | None | `GET` | `200` | `405`, `429` | Fleet grouping by tier and criticality from registry data. |
 | `/fleet/health` | None | `GET` | `200` | `503`, `405`, `429` | Fleet CI health from cache/GitHub (503 when unavailable and uncached). |
 | `/fleet/score` | None | `GET` | `200` | `405`, `429` | Aggregate fleet health score. |
 | `/fleet/trend` | None | `GET` | `200` | `405`, `429` | Per-repo CI conclusion trend. |
 | `/history` | None | `GET` | `200` | `405`, `429` | Activity history, supports `?limit=` (max 20), returns `{ history, count }`. |
-| `/github/stats` | None | `GET` | `200` | `405`, `429` | Org repo/star aggregates (`available: false` when GitHub is unreachable). |
+| `/github/stats` | None | `GET` | `200` | `405`, `429` | Org repo/star aggregates (`available: false` when GitHub is unreachable, including when the repos listing fails). |
 | `/github/events` | None | `GET` | `200` | `405`, `429` | Recent public GitHub events (`available: false` when GitHub is unreachable). |
 | `/posts/count` | None | `GET` | `200` | `405`, `429` | Blog post count from `clankamode.github.io` posts dir. |
 | `/openapi.json` | None | `GET` | `200` | `405`, `429` | OpenAPI 3 document for documented routes. |
@@ -31,7 +31,7 @@ Edge control API behind Clanka's public presence surface and fleet metadata. Run
 | `/heartbeat` | `Authorization: Bearer <ADMIN_KEY>` | `POST` | `200` | `400`, `401` | Heartbeat ping with optional history batch payload. |
 | `/set-presence` | `Authorization: Bearer <ADMIN_KEY>` | `POST` | `200` | `400`, `401` | Updates presence/team/activity objects and `last_seen`. |
 | `/admin/activity` | `Authorization: Bearer <ADMIN_KEY>` | `POST` | `200` | `400`, `401`, `405` | Appends normalized activity entries into `/history`. |
-| `/admin/tasks` | `Authorization: Bearer <ADMIN_KEY>` | `GET/POST/PUT/DELETE` | `200` | `401`, `405` | KV-backed task CRUD. |
+| `/admin/tasks` | `Authorization: Bearer <ADMIN_KEY>` | `GET/POST/PUT/DELETE` | `200` | `400`, `401`, `404`, `405` | KV-backed task CRUD. PUT/DELETE return `404` when `id` is not found. |
 | `/admin/refresh` | `ADMIN_TOKEN: <ADMIN_TOKEN>` | `POST` | `200` | `401`, `503`, `405` | Invalidates registry/CI caches. Header name is literally `ADMIN_TOKEN`. |
 
 ## Stack
@@ -135,8 +135,8 @@ KV-backed task CRUD (stored under `tasks` key in `CLANKA_STATE`).
 |--------|------|--------|
 | `GET` | — | Returns `[{ id, text, done }]` |
 | `POST` | `{ id, text, done }` | Appends task |
-| `PUT` | `{ id, ...fields }` | Updates task matching `id` |
-| `DELETE` | `{ id }` | Removes task matching `id` |
+| `PUT` | `{ id, ...fields }` | Updates task matching `id` (`404` if no match, `400` if `id` is missing) |
+| `DELETE` | `{ id }` | Removes task matching `id` (`404` if no match, `400` if `id` is missing) |
 
 All methods return `401` if `Authorization` header is absent or incorrect.
 
