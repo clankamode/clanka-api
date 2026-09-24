@@ -289,7 +289,7 @@ export const OPENAPI_SPEC = {
         summary: "Get parsed open tasks per repo",
         responses: {
           "200": {
-            description: "Task payload",
+            description: "Task payload. Per-repo available:false means TASKS.md could not be fetched, not that the file is empty.",
             content: {
               "application/json": {
                 schema: {
@@ -310,6 +310,8 @@ export const OPENAPI_SPEC = {
                           required: ["priority", "text", "done"],
                         },
                       },
+                      available: { type: "boolean" },
+                      error: { type: "string" },
                     },
                     required: ["repo", "tasks"],
                   },

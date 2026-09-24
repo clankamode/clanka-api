@@ -1,4 +1,4 @@
-import type { Env, RepoTask, TaskPriority } from "./types";
+import type { Env, RepoTask, RepoTasksPayload, TaskPriority } from "./types";
 import { decodeBase64 } from "./util";
 
 export function parseOpenTasksMarkdown(markdown: string): RepoTask[] {
@@ -33,7 +33,10 @@ export function parseOpenTasksMarkdown(markdown: string): RepoTask[] {
   return tasks;
 }
 
-export async function loadRepoTasks(env: Env, repo: string): Promise<RepoTask[]> {
+export async function loadRepoTasks(
+  env: Env,
+  repo: string,
+): Promise<Pick<RepoTasksPayload, "tasks" | "available" | "error">> {
   const repoName = repo.startsWith("clankamode/") ? repo.slice("clankamode/".length) : repo;
   const url = `https://api.github.com/repos/clankamode/${repoName}/contents/TASKS.md`;
   const headers: Record<string, string> = {
@@ -44,12 +47,13 @@ export async function loadRepoTasks(env: Env, repo: string): Promise<RepoTask[]>
 
   try {
     const res = await fetch(url, { headers });
-    if (!res.ok) return [];
+    if (res.status === 404) return { tasks: [], available: true };
+    if (!res.ok) return { tasks: [], available: false, error: "github_unavailable" };
     const body = await res.json() as { content?: string };
-    if (!body.content) return [];
+    if (!body.content) return { tasks: [], available: true };
     const markdown = decodeBase64(body.content);
-    return parseOpenTasksMarkdown(markdown);
+    return { tasks: parseOpenTasksMarkdown(markdown), available: true };
   } catch {
-    return [];
+    return { tasks: [], available: false, error: "github_unavailable" };
   }
 }

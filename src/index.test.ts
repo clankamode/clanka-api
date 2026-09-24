@@ -227,6 +227,43 @@ describe("GET /projects", () => {
     expect(body.cached).toBe(true);
   });
 
+  it("sets cached=false when registry is fetched live on KV miss", async () => {
+    const liveRegistry = {
+      tools: [
+        { repo: "clankamode/live-core", criticality: "critical", tier: "core", description: "Live core" },
+      ],
+    };
+    const content = Buffer.from(JSON.stringify(liveRegistry), "utf8").toString("base64");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ content }), { status: 200 }));
+
+    const env = {
+      CLANKA_STATE: createMockKV({}),
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    const res = await worker.fetch(req("/projects"), env as any);
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.cached).toBe(false);
+    expect(body.projects.map((p: { name: string }) => p.name)).toContain("live-core");
+  });
+
+  it("does not claim cached=true when GitHub fails on KV miss", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+    const env = {
+      CLANKA_STATE: createMockKV({}),
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    const res = await worker.fetch(req("/projects"), env as any);
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.projects).toEqual([]);
+    expect(body.cached).toBe(false);
+  });
+
   it("rejects non-GET with 405", async () => {
     const res = await worker.fetch(req("/projects", "POST"), createEnv());
     expect(res.status).toBe(405);
@@ -699,6 +736,26 @@ describe("GET /github/stats", () => {
     expect(body.repoCount).toBe(0);
   });
 
+  it("marks stats unavailable when the repos listing fails even if the user endpoint succeeds", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith("/users/clankamode")) {
+        return new Response(JSON.stringify({ public_repos: 9 }), { status: 200 });
+      }
+      return new Response("Bad Gateway", { status: 502 });
+    });
+
+    const res = await worker.fetch(req("/github/stats"), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.available).toBe(false);
+    expect(body.error).toBe("github_unavailable");
+    expect(body.totalStars).toBe(0);
+    expect(body.lastPushedAt).toBeNull();
+    expect(body.lastPushedRepo).toBeNull();
+  });
+
   it("returns live stats even when caching the payload fails", async () => {
     const env = {
       CLANKA_STATE: {
@@ -851,6 +908,8 @@ describe("GET /tasks", () => {
     expect(byRepo["clankamode/ci-triage"]).toEqual([
       { priority: "yellow", text: "Harden parser", done: false },
     ]);
+    expect(body.every((entry) => entry.available === true)).toBe(true);
+    expect(body.every((entry) => entry.error === undefined)).toBe(true);
   });
 
   it("returns empty task list for repos without TASKS.md", async () => {
@@ -861,6 +920,28 @@ describe("GET /tasks", () => {
     const byRepo = Object.fromEntries(body.map((entry) => [entry.repo, entry.tasks]));
     expect(byRepo["clankamode/clanka-api"]).toEqual([]);
     expect(byRepo["clankamode/ci-triage"]).toEqual([]);
+    expect(body.every((entry: { available: boolean }) => entry.available === true)).toBe(true);
+  });
+
+  it("marks per-repo tasks unavailable instead of looking empty when GitHub fails", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+    const res = await worker.fetch(req("/tasks"), createEnv());
+    expect(res.status).toBe(200);
+    const body = await json(res) as Array<{ repo: string; tasks: unknown[]; available?: boolean; error?: string }>;
+    expect(body).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        repo: "clankamode/clanka-api",
+        tasks: [],
+        available: false,
+        error: "github_unavailable",
+      }),
+      expect.objectContaining({
+        repo: "clankamode/ci-triage",
+        tasks: [],
+        available: false,
+        error: "github_unavailable",
+      }),
+    ]));
   });
 
   it("rejects non-GET with 405", async () => {
@@ -2078,6 +2159,7 @@ describe("GET /now and GET /pulse contracts", () => {
     }));
     expect(Array.isArray(body.history)).toBe(true);
     expect(body.team).toEqual(expect.objectContaining({ clanka: { status: "active" } }));
+    expect(body.current).toBe("monitoring workspace");
   });
 
   it("returns offline status in /now when heartbeat is stale", async () => {
@@ -2114,6 +2196,25 @@ describe("GET /now and GET /pulse contracts", () => {
     expect(body.timestamp).toBeNull();
     expect(body.current).toBe("offline");
     expect(body.uptime).toBe(0);
+  });
+
+  it("does not invent current=online when heartbeat is fresh but presence is missing", async () => {
+    const now = 1_750_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+
+    const res = await worker.fetch(
+      req("/now"),
+      createEnv({
+        last_seen: String(now - 1_000),
+      }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("unknown");
+    expect(body.current).toBe("unknown");
+    expect(body.current).not.toBe("online");
+    expect(body.last_seen).toBe(new Date(now - 1_000).toISOString());
   });
 
   it("does not invent epoch-sized uptime when started is zero", async () => {
@@ -2668,6 +2769,55 @@ describe("Admin task CRUD", () => {
     expect(JSON.parse(kvStore.tasks)).toEqual([
       { id: "t2", text: "verify branches", done: true },
     ]);
+  });
+
+  it("returns 400 when PUT or DELETE is missing id", async () => {
+    const env = {
+      CLANKA_STATE: createMockKV({
+        tasks: JSON.stringify([{ id: "t1", text: "ship coverage", done: false }]),
+      }),
+      ADMIN_KEY: "test-secret",
+    };
+
+    const putRes = await worker.fetch(
+      req("/admin/tasks", "PUT", { done: true }, authHeaders),
+      env as any,
+    );
+    expect(putRes.status).toBe(400);
+    expect(await json(putRes)).toEqual({ error: "Invalid body: id is required" });
+
+    const deleteRes = await worker.fetch(
+      req("/admin/tasks", "DELETE", {}, authHeaders),
+      env as any,
+    );
+    expect(deleteRes.status).toBe(400);
+    expect(await json(deleteRes)).toEqual({ error: "Invalid body: id is required" });
+  });
+
+  it("returns 404 when PUT or DELETE targets a missing task id", async () => {
+    const kvStore = {
+      tasks: JSON.stringify([{ id: "t1", text: "ship coverage", done: false }]),
+    };
+    const env = {
+      CLANKA_STATE: createMockKV(kvStore),
+      ADMIN_KEY: "test-secret",
+    };
+
+    const putRes = await worker.fetch(
+      req("/admin/tasks", "PUT", { id: "missing", done: true }, authHeaders),
+      env as any,
+    );
+    expect(putRes.status).toBe(404);
+    expect(await json(putRes)).toEqual({ error: "Task Not Found" });
+    expect(JSON.parse(kvStore.tasks)).toEqual([{ id: "t1", text: "ship coverage", done: false }]);
+
+    const deleteRes = await worker.fetch(
+      req("/admin/tasks", "DELETE", { id: "missing" }, authHeaders),
+      env as any,
+    );
+    expect(deleteRes.status).toBe(404);
+    expect(await json(deleteRes)).toEqual({ error: "Task Not Found" });
+    expect(JSON.parse(kvStore.tasks)).toEqual([{ id: "t1", text: "ship coverage", done: false }]);
   });
 
   it("falls back to an empty list when stored tasks JSON is malformed", async () => {

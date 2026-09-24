@@ -29,6 +29,7 @@ import {
 import {
   collectCacheKeysToInvalidate,
   loadRegistryEntries,
+  loadRegistrySource,
   loadToolsRegistryEntries,
   registryEntriesToProjects,
   searchRegistryTools,
@@ -542,28 +543,71 @@ export async function handleFetch(
       }
 
       if (request.method === 'PUT') {
-        const body = await request.json();
+        let body: unknown;
+        try {
+          body = await request.json();
+        } catch {
+          return respond(JSON.stringify({ error: "Invalid body" }), {
+            status: 400,
+            headers: corsHeaders,
+          });
+        }
+        if (!body || typeof body !== "object" || Array.isArray(body) || (body as { id?: unknown }).id === undefined) {
+          return respond(JSON.stringify({ error: "Invalid body: id is required" }), {
+            status: 400,
+            headers: corsHeaders,
+          });
+        }
+        const targetId = (body as { id: unknown }).id;
         const tasksRaw = await env.CLANKA_STATE.get("tasks") || "[]";
         const tasks = safeParseJSON<unknown[]>(tasksRaw, []);
-        const nextTasks = tasks.map((task) => {
-          if (!task || typeof task !== "object" || Array.isArray(task)) return task;
-          const item = task as { id?: unknown };
-          return item.id === (body as { id?: unknown }).id
-            ? { ...task, ...body as Record<string, unknown> }
-            : task;
+        const matchIndex = tasks.findIndex((task) => {
+          if (!task || typeof task !== "object" || Array.isArray(task)) return false;
+          return (task as { id?: unknown }).id === targetId;
+        });
+        if (matchIndex < 0) {
+          return respond(JSON.stringify({ error: "Task Not Found" }), {
+            status: 404,
+            headers: corsHeaders,
+          });
+        }
+        const nextTasks = tasks.map((task, index) => {
+          if (index !== matchIndex) return task;
+          return { ...(task as Record<string, unknown>), ...(body as Record<string, unknown>) };
         });
         await env.CLANKA_STATE.put("tasks", JSON.stringify(nextTasks));
         return respond(JSON.stringify({ success: true }), { headers: corsHeaders });
       }
 
       if (request.method === 'DELETE') {
-        const body = await request.json() as { id?: unknown };
+        let body: unknown;
+        try {
+          body = await request.json();
+        } catch {
+          return respond(JSON.stringify({ error: "Invalid body" }), {
+            status: 400,
+            headers: corsHeaders,
+          });
+        }
+        if (!body || typeof body !== "object" || Array.isArray(body) || (body as { id?: unknown }).id === undefined) {
+          return respond(JSON.stringify({ error: "Invalid body: id is required" }), {
+            status: 400,
+            headers: corsHeaders,
+          });
+        }
+        const targetId = (body as { id: unknown }).id;
         const tasksRaw = await env.CLANKA_STATE.get("tasks") || "[]";
         const tasks = safeParseJSON<unknown[]>(tasksRaw, []);
         const nextTasks = tasks.filter((task) => {
           if (!task || typeof task !== "object" || Array.isArray(task)) return true;
-          return (task as { id?: unknown }).id !== body.id;
+          return (task as { id?: unknown }).id !== targetId;
         });
+        if (nextTasks.length === tasks.length) {
+          return respond(JSON.stringify({ error: "Task Not Found" }), {
+            status: 404,
+            headers: corsHeaders,
+          });
+        }
         await env.CLANKA_STATE.put("tasks", JSON.stringify(nextTasks));
         return respond(JSON.stringify({ success: true }), { headers: corsHeaders });
       }
@@ -614,13 +658,13 @@ export async function handleFetch(
         });
       }
 
-      const entries = await loadRegistryEntries(env);
+      const { entries, cached } = await loadRegistrySource(env);
       const projects = entries.length > 0
         ? registryEntriesToProjects(entries)
         : [];
 
       return respond(
-        JSON.stringify({ projects, source: "registry", cached: true }),
+        JSON.stringify({ projects, source: "registry", cached }),
         { headers: corsHeaders },
       );
     }
@@ -729,10 +773,15 @@ export async function handleFetch(
       const entries = await loadRegistryEntries(env);
       const repos = entries.map((entry) => entry.repo);
       const payload: RepoTasksPayload[] = await Promise.all(
-        repos.map(async (repo) => ({
-          repo,
-          tasks: await loadRepoTasks(env, repo),
-        })),
+        repos.map(async (repo) => {
+          const loaded = await loadRepoTasks(env, repo);
+          return {
+            repo,
+            tasks: loaded.tasks,
+            available: loaded.available,
+            ...(loaded.error ? { error: loaded.error } : {}),
+          };
+        }),
       );
 
       return respond(JSON.stringify(payload), { headers: corsHeaders });
@@ -769,13 +818,11 @@ export async function handleFetch(
         : (typeof presence?.state === "string" && presence.state.trim()
           ? presence.state.trim()
           : "unknown");
-      const current = offline
-        ? (typeof presence?.message === "string" && presence.message.trim()
-          ? presence.message
-          : "offline")
-        : (typeof presence?.message === "string" && presence.message.trim()
-          ? presence.message
-          : "online");
+      // Current-work is the presence message when we have one; otherwise
+      // fall back to status. Never invent "online" for an empty/unknown payload.
+      const current = typeof presence?.message === "string" && presence.message.trim()
+        ? presence.message
+        : status;
 
       return respond(JSON.stringify({
         current,

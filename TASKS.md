@@ -1,5 +1,5 @@
 # TASKS.md — clanka-api
-> Last updated: 2026-03-12 | Status: open
+> Last updated: 2026-09-15 | Status: open
 
 ## 🔴 High Priority
 - [x] **Deploy to Cloudflare** — live at https://clanka-api.clankamode.workers.dev (deployed 2026-02-26)
@@ -44,3 +44,4 @@
 - Stack: Cloudflare Workers + KV (`CLANKA_STATE`), TypeScript, Wrangler
 - All source in `src/index.ts` — single-file worker
 - Bearer token auth on write endpoints (Cloudflare secret `ADMIN_TOKEN`)
+- Honesty pass (2026-09-15): `/now` no longer invents `current: "online"`; `/projects` reports real `cached`; GitHub stats/tasks distinguish fetch failure from empty; `/admin/tasks` PUT/DELETE no longer succeed on missing ids.
