@@ -17,7 +17,7 @@ const inMemoryMetrics: MetricsState = {
   kv_misses: 0,
 };
 
-export function getClientIp(request: Request): string {
+function getClientIp(request: Request): string {
   const connectingIp = request.headers.get("CF-Connecting-IP");
   if (connectingIp) return connectingIp;
   const forwarded = request.headers.get("X-Forwarded-For");
