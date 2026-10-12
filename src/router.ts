@@ -8,7 +8,6 @@ import {
   startTime,
 } from "./config";
 import {
-  FLEET_REGISTRY,
   isFleetHealthFresh,
   loadFleetHealthFromGithub,
   loadFleetScorePayload,
@@ -36,7 +35,7 @@ import {
 } from "./registry";
 import { loadRepoTasks } from "./tasks";
 import type { Env, FleetRepo, RepoTasksPayload, WorkerExecutionContext } from "./types";
-import { decodeBase64, safeParseJSON } from "./util";
+import { safeParseJSON } from "./util";
 import {
   countActiveAgents,
   getStatusPayload,
