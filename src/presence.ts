@@ -69,7 +69,7 @@ export function getStatusUptimePayload(lastSeenRaw: string | null) {
   };
 }
 
-export function makeHistoryHash(timestamp: number): string {
+function makeHistoryHash(timestamp: number): string {
   return Math.floor(timestamp).toString(16).slice(-8);
 }
 

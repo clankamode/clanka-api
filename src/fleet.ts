@@ -12,7 +12,6 @@ import type {
   FleetCriticality,
   FleetHealthPayload,
   FleetHealthStatus,
-  FleetRepo,
   FleetRepoHealth,
   FleetScorePayload,
   FleetTrendDirection,
@@ -21,9 +20,6 @@ import type {
   RegistryEntry,
 } from "./types";
 import { safeParseJSON } from "./util";
-
-// Fleet registry is now derived from the live registry — kept for any legacy references
-export const FLEET_REGISTRY: FleetRepo[] = [];
 
 function fleetStatusSeverity(status: FleetHealthStatus): number {
   if (status === "RED") return 3;

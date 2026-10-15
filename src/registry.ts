@@ -10,7 +10,7 @@ import {
   fleetCiTrendCacheKey,
 } from "./config";
 import type { Env, FleetCriticality, FleetTier, Project, RegistryEntry } from "./types";
-import { decodeBase64, safeParseJSON } from "./util";
+import { decodeBase64 } from "./util";
 
 function isFleetTier(value: unknown): value is FleetTier {
   return value === "ops"

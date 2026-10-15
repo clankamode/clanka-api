@@ -1,7 +1,7 @@
 import type { Env, RepoTask, RepoTasksPayload, TaskPriority } from "./types";
 import { decodeBase64 } from "./util";
 
-export function parseOpenTasksMarkdown(markdown: string): RepoTask[] {
+function parseOpenTasksMarkdown(markdown: string): RepoTask[] {
   const lines = markdown.split(/\r?\n/);
   const tasks: RepoTask[] = [];
   let currentPriority: TaskPriority | null = null;

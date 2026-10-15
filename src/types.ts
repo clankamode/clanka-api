@@ -21,7 +21,7 @@ export type FleetHealthPayload = {
   checkedAt: string;
 };
 export type FleetTrendDirection = "up" | "down" | "flat" | "unknown";
-export type FleetRepoTrend = {
+type FleetRepoTrend = {
   repo: string;
   criticality: FleetCriticality;
   last5: string[];
