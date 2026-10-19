@@ -198,6 +198,8 @@ describe("GET /projects", () => {
       expect(p).toHaveProperty("url");
       expect(p).toHaveProperty("status");
       expect(p).toHaveProperty("last_updated");
+      expect(p.last_updated).toBe("unknown");
+      expect(p.last_updated).not.toBe(new Date().toISOString().slice(0, 10));
       expect(p.status).toBe("registered");
       expect(p.status).not.toBe("active");
     }
@@ -225,6 +227,8 @@ describe("GET /projects", () => {
     expect(body.projects).toEqual([]);
     expect(body.source).toBe("registry");
     expect(body.cached).toBe(true);
+    expect(body.available).toBe(true);
+    expect(body).not.toHaveProperty("error");
   });
 
   it("sets cached=false when registry is fetched live on KV miss", async () => {
@@ -262,6 +266,8 @@ describe("GET /projects", () => {
     expect(res.status).toBe(200);
     expect(body.projects).toEqual([]);
     expect(body.cached).toBe(false);
+    expect(body.available).toBe(false);
+    expect(body.error).toBe("github_unavailable");
   });
 
   it("rejects non-GET with 405", async () => {
@@ -325,6 +331,8 @@ describe("GET /tools", () => {
     const res = await worker.fetch(req("/tools"), createEnv());
     const body = await json(res);
     expect(body.cached).toBe(true);
+    expect(body.available).toBe(true);
+    expect(body).not.toHaveProperty("error");
   });
 
   it("supports registry payloads stored under an entries array shape", async () => {
@@ -437,6 +445,32 @@ describe("GET /tools", () => {
     expect(body.tools).toEqual([]);
     expect(body.count).toBe(0);
     expect(body.cached).toBe(false);
+    expect(body.available).toBe(false);
+    expect(body.error).toBe("github_unavailable");
+  });
+
+  it("labels stale registry data when GitHub fails instead of looking like a live empty catalog", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+    const stale = [
+      { repo: "clankamode/stale-tool", criticality: "high", tier: "ops", description: "Stale tool" },
+    ];
+    const res = await worker.fetch(
+      req("/tools"),
+      createEnv({
+        "registry:v1": "",
+        "registry:v1:stale": JSON.stringify(stale),
+      }, { GITHUB_TOKEN: "gh-token" }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.available).toBe(true);
+    expect(body.stale).toBe(true);
+    expect(body.cached).toBe(false);
+    expect(body.tools).toEqual([
+      expect.objectContaining({ repo: "clankamode/stale-tool" }),
+    ]);
+    expect(body).not.toHaveProperty("error");
   });
 
   it("rejects non-GET with 405", async () => {
@@ -484,6 +518,20 @@ describe("GET /tools/:repo", () => {
 
     expect(res.status).toBe(404);
     expect(body).toEqual({ error: "Tool Not Found" });
+  });
+
+  it("returns 503 when the registry cannot be loaded instead of pretending the tool is missing", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+    const env = {
+      CLANKA_STATE: createMockKV({}),
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    const res = await worker.fetch(req("/tools/clankamode%2Fclanka-api"), env as any);
+    const body = await json(res);
+
+    expect(res.status).toBe(503);
+    expect(body).toEqual({ error: "github_unavailable" });
   });
 
   it("returns 400 for invalid URL-encoding in repo path", async () => {
@@ -572,6 +620,27 @@ describe("GET /tools/search", () => {
     expect(body).toEqual({ error: "Missing query parameter: q" });
   });
 
+  it("marks search unavailable instead of looking like zero matches when GitHub fails", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+    const env = {
+      CLANKA_STATE: createMockKV({}),
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    const res = await worker.fetch(req("/tools/search?q=clanka"), env as any);
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      query: "clanka",
+      tools: [],
+      count: 0,
+      cached: false,
+      available: false,
+      error: "github_unavailable",
+    }));
+  });
+
   it("rejects non-GET with 405", async () => {
     const res = await worker.fetch(req("/tools/search?q=clanka", "POST"), createEnv());
     expect(res.status).toBe(405);
@@ -592,6 +661,8 @@ describe("Malformed cache fallbacks", () => {
     expect(body).toEqual(expect.objectContaining({
       tools: [],
       count: 0,
+      available: false,
+      error: "github_unavailable",
     }));
   });
 
@@ -923,6 +994,20 @@ describe("GET /tasks", () => {
     expect(body.every((entry: { available: boolean }) => entry.available === true)).toBe(true);
   });
 
+  it("returns 503 when the registry cannot be loaded instead of an empty task list", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+    const env = {
+      CLANKA_STATE: createMockKV({}),
+      ADMIN_KEY: "test-secret",
+      GITHUB_TOKEN: "gh-token",
+    };
+    const res = await worker.fetch(req("/tasks"), env as any);
+    const body = await json(res);
+
+    expect(res.status).toBe(503);
+    expect(body).toEqual({ error: "github_unavailable" });
+  });
+
   it("marks per-repo tasks unavailable instead of looking empty when GitHub fails", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
     const res = await worker.fetch(req("/tasks"), createEnv());
@@ -990,6 +1075,8 @@ describe("Registry alignment and fallback", () => {
     expect(res.status).toBe(200);
     expect(body.count).toBe(0);
     expect(body.tools).toEqual([]);
+    expect(body.available).toBe(false);
+    expect(body.error).toBe("github_unavailable");
   });
 
   it("filters malformed registry entries before serving /tools", async () => {
@@ -1141,6 +1228,31 @@ describe("GET /changelog", () => {
     }));
   });
 
+  it("does not invent a commit date when GitHub omits author and committer dates", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([
+      {
+        sha: "nodate123",
+        commit: {
+          message: "chore: undated",
+        },
+        author: { login: "clanka" },
+      },
+    ]), { status: 200 }));
+
+    const res = await worker.fetch(req("/changelog"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.available).toBe(true);
+    expect(body.commits[0]).toEqual({
+      sha: "nodate123",
+      message: "chore: undated",
+      author: "clanka",
+      date: "",
+    });
+    expect(Number.isNaN(Date.parse(body.commits[0].date))).toBe(true);
+  });
+
   it("marks a genuine empty changelog as available", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
     const res = await worker.fetch(req("/changelog"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
@@ -1229,6 +1341,8 @@ describe("GET /fleet/summary", () => {
       totalRepos: 0,
       repos: [],
       source: "registry",
+      available: false,
+      error: "github_unavailable",
     }));
     expect(body.tiers).toEqual({
       ops: [],
@@ -1272,6 +1386,8 @@ describe("GET /fleet/summary", () => {
       medium: [],
     });
     expect(body.source).toBe("registry");
+    expect(body.available).toBe(true);
+    expect(body).not.toHaveProperty("error");
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -1599,7 +1715,7 @@ describe("GET /fleet/health", () => {
     const body = await json(res);
 
     expect(res.status).toBe(200);
-    expect(body).toEqual(stalePayload);
+    expect(body).toEqual({ ...stalePayload, stale: true });
   });
 
   it("returns 503 when both GitHub and KV fail", async () => {
@@ -1688,16 +1804,8 @@ describe("GET /fleet/score", () => {
     );
     const body = await json(res);
 
-    expect(res.status).toBe(200);
-    expect(body).toEqual(expect.objectContaining({
-      score: 0,
-      status: "UNKNOWN",
-      totalRepos: 0,
-      healthyRepos: 0,
-      degradedRepos: 0,
-      unknownRepos: 0,
-      timestamp: expect.any(String),
-    }));
+    expect(res.status).toBe(503);
+    expect(body).toEqual({ error: "Service Unavailable" });
   });
 
   it("rejects non-GET with 405", async () => {
@@ -1764,16 +1872,22 @@ describe("GET /fleet/trend", () => {
 
     expect(res.status).toBe(200);
     expect(body.totalRepos).toBe(2);
+    expect(body.available).toBe(false);
+    expect(body.error).toBe("no token");
     expect(body.repos).toEqual(expect.arrayContaining([
       expect.objectContaining({
         repo: "clankamode/clanka-api",
         last5: [],
         direction: "unknown",
+        available: false,
+        error: "no token",
       }),
       expect.objectContaining({
         repo: "clankamode/ci-triage",
         last5: [],
         direction: "unknown",
+        available: false,
+        error: "no token",
       }),
     ]));
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -1830,14 +1944,28 @@ describe("GET /fleet/trend", () => {
     const body = await json(res);
 
     expect(res.status).toBe(200);
+    expect(body.available).toBe(false);
+    expect(body.error).toBe("github_unavailable");
     expect(body.repos).toEqual(expect.arrayContaining([
-      expect.objectContaining({ repo: "clankamode/clanka-api", last5: [], direction: "unknown" }),
-      expect.objectContaining({ repo: "clankamode/ci-triage", last5: [], direction: "unknown" }),
+      expect.objectContaining({
+        repo: "clankamode/clanka-api",
+        last5: [],
+        direction: "unknown",
+        available: false,
+        error: "github_unavailable",
+      }),
+      expect.objectContaining({
+        repo: "clankamode/ci-triage",
+        last5: [],
+        direction: "unknown",
+        available: false,
+        error: "github_unavailable",
+      }),
     ]));
   });
 
   it("normalizes null conclusions and limits history to 5 runs", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
       workflow_runs: [
         { conclusion: null, status: "in_progress" },
         { conclusion: null, status: "queued" },
@@ -1854,6 +1982,30 @@ describe("GET /fleet/trend", () => {
     expect(res.status).toBe(200);
     expect(body.repos[0].last5).toHaveLength(5);
     expect(body.repos[0].last5[0]).toBe("null");
+    expect(body.available).toBe(true);
+    expect(body.repos[0].available).toBe(true);
+    expect(body).not.toHaveProperty("error");
+  });
+
+  it("marks a genuine empty CI history as available with unknown direction", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
+      workflow_runs: [],
+    }), { status: 200 }));
+
+    const res = await worker.fetch(req("/fleet/trend"), createEnv({}, { GITHUB_TOKEN: "gh-token" }));
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body.available).toBe(true);
+    expect(body).not.toHaveProperty("error");
+    expect(body.repos).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        repo: "clankamode/clanka-api",
+        last5: [],
+        direction: "unknown",
+        available: true,
+      }),
+    ]));
   });
 
   it("returns CORS headers", async () => {
@@ -2367,6 +2519,16 @@ describe("GET /status", () => {
 });
 
 describe("OpenAPI /status contract honesty", () => {
+  it("documents 503 when registry or fleet health cannot be loaded", async () => {
+    const res = await worker.fetch(req("/openapi.json"), createEnv());
+    const body = await json(res);
+    expect(body.paths?.["/tools/{repo}"]?.get?.responses?.["503"]).toBeTruthy();
+    expect(body.paths?.["/fleet/score"]?.get?.responses?.["503"]).toBeTruthy();
+    expect(body.paths?.["/fleet/health"]?.get?.responses?.["200"]?.content?.["application/json"]?.schema?.properties?.stale).toBeTruthy();
+    expect(body.paths?.["/tools"]?.get?.responses?.["200"]?.content?.["application/json"]?.schema?.properties?.available).toBeTruthy();
+    expect(body.paths?.["/projects"]?.get?.responses?.["200"]?.content?.["application/json"]?.schema?.properties?.available).toBeTruthy();
+  });
+
   it("documents ok/version/endpoints instead of the /health liveness shape", async () => {
     const res = await worker.fetch(req("/openapi.json"), createEnv());
     const body = await json(res);
@@ -2771,6 +2933,24 @@ describe("Admin task CRUD", () => {
     ]);
   });
 
+  it("returns 400 when POST is missing id instead of appending a silent success", async () => {
+    const kvStore = {
+      tasks: JSON.stringify([{ id: "t1", text: "ship coverage", done: false }]),
+    };
+    const env = {
+      CLANKA_STATE: createMockKV(kvStore),
+      ADMIN_KEY: "test-secret",
+    };
+
+    const res = await worker.fetch(
+      req("/admin/tasks", "POST", { text: "no id" }, authHeaders),
+      env as any,
+    );
+    expect(res.status).toBe(400);
+    expect(await json(res)).toEqual({ error: "Invalid body: id is required" });
+    expect(JSON.parse(kvStore.tasks)).toEqual([{ id: "t1", text: "ship coverage", done: false }]);
+  });
+
   it("returns 400 when PUT or DELETE is missing id", async () => {
     const env = {
       CLANKA_STATE: createMockKV({
@@ -2888,6 +3068,29 @@ describe("GET /posts/count", () => {
       available: true,
     });
     fetchSpy.mockRestore();
+  });
+
+  it("includes available:true on a cache hit so callers can tell it from a failure placeholder", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not be called"));
+    const cached = {
+      count: 4,
+      lastPost: "004",
+      lastPostDate: "2026-04-09",
+      lastPostSlug: "cached-post",
+    };
+
+    const res = await worker.fetch(
+      req("/posts/count"),
+      createEnv({ "blog:posts:count:v1": JSON.stringify(cached) }),
+    );
+    const body = await json(res);
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({
+      ...cached,
+      available: true,
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it("marks posts unavailable instead of looking like zero posts when GitHub fails", async () => {
@@ -3133,6 +3336,32 @@ describe("POST /set-presence", () => {
     const body = await json(res);
     expect(res.status).toBe(200);
     expect(body).toEqual({ success: true });
+  });
+
+  it("returns 400 when presence.state is empty instead of silently defaulting to active", async () => {
+    const payload = {
+      ...VALID_SET_PRESENCE_PAYLOAD,
+      presence: { state: "   ", message: "shipping" },
+    };
+    const env = createEnv();
+    const res = await worker.fetch(req("/set-presence", "POST", payload, authHeaders), env);
+    const body = await json(res);
+
+    expect(res.status).toBe(400);
+    expect(body).toEqual({ error: "Invalid body: presence.state is required" });
+    expect(env.CLANKA_STATE.__store.presence).toBeUndefined();
+  });
+
+  it("returns 400 when presence.state is missing", async () => {
+    const payload = {
+      ...VALID_SET_PRESENCE_PAYLOAD,
+      presence: { message: "shipping" },
+    };
+    const res = await worker.fetch(req("/set-presence", "POST", payload, authHeaders), createEnv());
+    const body = await json(res);
+
+    expect(res.status).toBe(400);
+    expect(body).toEqual({ error: "Invalid body: presence.state is required" });
   });
 });
 

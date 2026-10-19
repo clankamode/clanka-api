@@ -9,7 +9,7 @@ import {
   fleetCiCacheKey,
   fleetCiTrendCacheKey,
 } from "./config";
-import type { Env, FleetCriticality, FleetTier, Project, RegistryEntry } from "./types";
+import type { Env, FleetCriticality, FleetTier, Project, RegistryEntry, RegistryLoadResult } from "./types";
 import { decodeBase64 } from "./util";
 
 function isFleetTier(value: unknown): value is FleetTier {
@@ -85,9 +85,16 @@ function parseRegistryEntries(raw: string | null): RegistryEntry[] | null {
   }
 }
 
-export async function loadRegistrySource(env: Env): Promise<{ entries: RegistryEntry[]; cached: boolean }> {
+function unavailableRegistry(staleEntries: RegistryEntry[] | null): RegistryLoadResult {
+  if (staleEntries !== null) {
+    return { entries: staleEntries, cached: false, available: true, stale: true };
+  }
+  return { entries: [], cached: false, available: false, error: "github_unavailable" };
+}
+
+export async function loadRegistrySource(env: Env): Promise<RegistryLoadResult> {
   const cachedEntries = parseRegistryEntries(await env.CLANKA_STATE.get(REGISTRY_CACHE_KEY));
-  if (cachedEntries !== null) return { entries: cachedEntries, cached: true };
+  if (cachedEntries !== null) return { entries: cachedEntries, cached: true, available: true };
 
   const staleEntries = parseRegistryEntries(await env.CLANKA_STATE.get(REGISTRY_STALE_CACHE_KEY));
 
@@ -99,10 +106,10 @@ export async function loadRegistrySource(env: Env): Promise<{ entries: RegistryE
     if (env.GITHUB_TOKEN) headers["Authorization"] = `Bearer ${env.GITHUB_TOKEN}`;
 
     const res = await fetch(REGISTRY_URL, { headers });
-    if (!res.ok) return { entries: staleEntries ?? [], cached: false };
+    if (!res.ok) return unavailableRegistry(staleEntries);
     const meta = await res.json() as { content?: string };
     if (typeof meta.content !== "string" || meta.content.length === 0) {
-      return { entries: staleEntries ?? [], cached: false };
+      return unavailableRegistry(staleEntries);
     }
     const json = decodeBase64(meta.content);
     const entries = extractRegistryEntries(JSON.parse(json) as unknown);
@@ -114,21 +121,19 @@ export async function loadRegistrySource(env: Env): Promise<{ entries: RegistryE
         expirationTtl: REGISTRY_STALE_TTL_SEC,
       }),
     ]);
-    return { entries, cached: false };
+    return { entries, cached: false, available: true };
   } catch {
-    return { entries: staleEntries ?? [], cached: false };
+    return unavailableRegistry(staleEntries);
   }
 }
 
-export async function loadRegistryEntries(env: Env): Promise<RegistryEntry[]> {
-  return (await loadRegistrySource(env)).entries;
-}
-
-export async function loadToolsRegistryEntries(env: Env): Promise<{ entries: RegistryEntry[]; cached: boolean }> {
+export async function loadToolsRegistryEntries(env: Env): Promise<RegistryLoadResult> {
   const cachedEntries = parseRegistryEntries(await env.CLANKA_STATE.get(REGISTRY_CACHE_KEY));
   if (cachedEntries !== null) {
-    return { entries: cachedEntries, cached: true };
+    return { entries: cachedEntries, cached: true, available: true };
   }
+
+  const staleEntries = parseRegistryEntries(await env.CLANKA_STATE.get(REGISTRY_STALE_CACHE_KEY));
 
   try {
     const headers: Record<string, string> = {
@@ -138,10 +143,10 @@ export async function loadToolsRegistryEntries(env: Env): Promise<{ entries: Reg
     if (env.GITHUB_TOKEN) headers["Authorization"] = `Bearer ${env.GITHUB_TOKEN}`;
 
     const res = await fetch(REGISTRY_URL, { headers });
-    if (!res.ok) return { entries: [], cached: false };
+    if (!res.ok) return unavailableRegistry(staleEntries);
     const meta = await res.json() as { content?: string };
     if (typeof meta.content !== "string" || meta.content.length === 0) {
-      return { entries: [], cached: false };
+      return unavailableRegistry(staleEntries);
     }
 
     const decoded = decodeBase64(meta.content);
@@ -149,10 +154,22 @@ export async function loadToolsRegistryEntries(env: Env): Promise<{ entries: Reg
     await env.CLANKA_STATE.put(REGISTRY_CACHE_KEY, JSON.stringify(entries), {
       expirationTtl: TOOLS_REGISTRY_TTL_SEC,
     });
-    return { entries, cached: false };
+    return { entries, cached: false, available: true };
   } catch {
-    return { entries: [], cached: false };
+    return unavailableRegistry(staleEntries);
   }
+}
+
+export function registryAvailabilityFields(source: Pick<RegistryLoadResult, "available" | "stale" | "error">): {
+  available: boolean;
+  stale?: boolean;
+  error?: string;
+} {
+  return {
+    available: source.available,
+    ...(source.stale ? { stale: true } : {}),
+    ...(source.error ? { error: source.error } : {}),
+  };
 }
 
 export function searchRegistryTools(entries: RegistryEntry[], query: string): RegistryEntry[] {
@@ -203,7 +220,6 @@ export async function collectCacheKeysToInvalidate(env: Env): Promise<string[]> 
 }
 
 export function registryEntriesToProjects(entries: RegistryEntry[]): Project[] {
-  const today = new Date().toISOString().slice(0, 10);
   return entries
     .filter((e) => e.tier === "core" || e.criticality === "critical")
     .map((e) => ({
@@ -212,6 +228,7 @@ export function registryEntriesToProjects(entries: RegistryEntry[]): Project[] {
       url: `https://github.com/${e.repo}`,
       // Registry membership ≠ runtime liveness; do not advertise "active".
       status: "registered",
-      last_updated: today,
+      // Registry JSON has no mtime; do not invent "updated today".
+      last_updated: "unknown",
     }));
 }

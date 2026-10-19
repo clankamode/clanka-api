@@ -1,5 +1,5 @@
 # TASKS.md — clanka-api
-> Last updated: 2026-09-15 | Status: open
+> Last updated: 2026-10-19 | Status: open
 
 ## 🔴 High Priority
 - [x] **Deploy to Cloudflare** — live at https://clanka-api.clankamode.workers.dev (deployed 2026-02-26)
@@ -10,7 +10,7 @@
 - [x] **Add `/tasks` endpoint** — reads `TASKS.md` from each registered repo, parses open checkboxes, returns `{ repo, tasks: [{ priority, text, done }] }[]` (completed 2026-02-28)
 - [x] **Add auth middleware tests** — test: missing auth → 401, wrong token → 401, correct token → 200
 - [x] **Add request logging** — log each request to KV list with TTL; max 100 entries rolling
-- [x] **KV TTL on presence** — if no heartbeat in 10 min, `/status` returns `{ status: "offline" }`
+- [x] **KV TTL on presence** — if no heartbeat in 10 min, `/health` and `/status/uptime` return `{ status: "offline" }` (`/status` is the discovery contract, not liveness)
 
 ## 🟢 Low Priority / Nice to Have
 - [x] **`/changelog` endpoint** — last 10 git commits from key repos via GitHub API
@@ -42,6 +42,7 @@
 
 ## 🧠 Notes
 - Stack: Cloudflare Workers + KV (`CLANKA_STATE`), TypeScript, Wrangler
-- All source in `src/index.ts` — single-file worker
-- Bearer token auth on write endpoints (Cloudflare secret `ADMIN_TOKEN`)
+- Handlers in `src/router.ts`; `src/index.ts` re-exports `fetch`
+- Bearer token auth on write endpoints (Cloudflare secret `ADMIN_KEY`); `/metrics` and `/admin/refresh` use `ADMIN_TOKEN`
 - Honesty pass (2026-09-15): `/now` no longer invents `current: "online"`; `/projects` reports real `cached`; GitHub stats/tasks distinguish fetch failure from empty; `/admin/tasks` PUT/DELETE no longer succeed on missing ids.
+- Second honesty pass (2026-10-19): registry/tools/projects/summary mark GitHub failure `available: false`; `/tools/:repo` and `/tasks` 503 when the registry cannot be loaded; `/fleet/score` 503 instead of score 0; `/fleet/trend` distinguishes no-token/GitHub failure from empty history; stale `/fleet/health` is labeled; projects no longer invent `last_updated` as today; changelog no longer invents commit dates; `/set-presence` rejects empty state; `/admin/tasks` POST requires `id`.

@@ -66,7 +66,7 @@ function parsePostFilename(name: string): { date: string; slug: string } | null 
 
 export async function loadPostsCount(env: Env): Promise<PostsCountPayload> {
   const cached = parsePostsCountCached(await env.CLANKA_STATE.get(BLOG_POSTS_CACHE_KEY));
-  if (cached !== null) return cached;
+  if (cached !== null) return { ...cached, available: true };
 
   const headers: Record<string, string> = {
     "User-Agent": "clanka-api/1.0",
@@ -158,12 +158,12 @@ function normalizeChangelogEntry(entry: unknown): ChangelogEntry | null {
     ? (item.author as { login: string }).login
     : typeof commit?.author?.name === "string"
       ? commit.author.name
-      : "unknown";
+      : "";
   const date = typeof commit?.author?.date === "string"
     ? commit.author.date
     : typeof commit?.committer?.date === "string"
       ? commit.committer.date
-      : new Date().toISOString();
+      : "";
   if (!directSha) return null;
   return {
     sha: directSha,
