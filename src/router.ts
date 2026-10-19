@@ -27,9 +27,9 @@ import {
 } from "./middleware";
 import {
   collectCacheKeysToInvalidate,
-  loadRegistryEntries,
   loadRegistrySource,
   loadToolsRegistryEntries,
+  registryAvailabilityFields,
   registryEntriesToProjects,
   searchRegistryTools,
 } from "./registry";
@@ -154,7 +154,13 @@ export async function handleFetch(
       const team = payload.team as Record<string, unknown>;
       const activity = payload.activity as Record<string, unknown>;
       const tasks = payload.tasks;
-      const state = typeof presence.state === "string" && presence.state.trim() ? presence.state.trim() : "active";
+      if (typeof presence.state !== "string" || !presence.state.trim()) {
+        return respond(JSON.stringify({ error: "Invalid body: presence.state is required" }), {
+          status: 400,
+          headers: corsHeaders,
+        });
+      }
+      const state = presence.state.trim();
       const message = typeof presence.message === "string" ? presence.message : undefined;
       const ttl = typeof payload.ttl === "number" && Number.isFinite(payload.ttl) && payload.ttl > 0
         ? payload.ttl
@@ -397,8 +403,8 @@ export async function handleFetch(
         });
       }
 
-      const registryEntries = await loadRegistryEntries(env);
-      const fleetItems: FleetRepo[] = registryEntries
+      const registry = await loadRegistrySource(env);
+      const fleetItems: FleetRepo[] = registry.entries
         .map((e) => ({
           repo: e.repo,
           criticality: e.criticality,
@@ -439,6 +445,7 @@ export async function handleFetch(
           tiers,
           byCriticality,
           source: "registry",
+          ...registryAvailabilityFields(registry),
         }),
         { headers: corsHeaders },
       );
@@ -462,7 +469,7 @@ export async function handleFetch(
         return respond(JSON.stringify(payload), { headers: corsHeaders });
       } catch {
         if (cachedPayload) {
-          return respond(JSON.stringify(cachedPayload), { headers: corsHeaders });
+          return respond(JSON.stringify({ ...cachedPayload, stale: true }), { headers: corsHeaders });
         }
         return respond(JSON.stringify({ error: "Service Unavailable" }), {
           status: 503,
@@ -480,6 +487,12 @@ export async function handleFetch(
       }
 
       const payload = await loadFleetScorePayload(env);
+      if (!payload) {
+        return respond(JSON.stringify({ error: "Service Unavailable" }), {
+          status: 503,
+          headers: corsHeaders,
+        });
+      }
       return respond(JSON.stringify(payload), { headers: corsHeaders });
     }
 
@@ -533,7 +546,21 @@ export async function handleFetch(
       }
 
       if (request.method === 'POST') {
-        const body = await request.json();
+        let body: unknown;
+        try {
+          body = await request.json();
+        } catch {
+          return respond(JSON.stringify({ error: "Invalid body" }), {
+            status: 400,
+            headers: corsHeaders,
+          });
+        }
+        if (!body || typeof body !== "object" || Array.isArray(body) || (body as { id?: unknown }).id === undefined) {
+          return respond(JSON.stringify({ error: "Invalid body: id is required" }), {
+            status: 400,
+            headers: corsHeaders,
+          });
+        }
         const tasksRaw = await env.CLANKA_STATE.get("tasks") || "[]";
         const tasks = safeParseJSON<unknown[]>(tasksRaw, []);
         tasks.push(body);
@@ -657,13 +684,18 @@ export async function handleFetch(
         });
       }
 
-      const { entries, cached } = await loadRegistrySource(env);
-      const projects = entries.length > 0
-        ? registryEntriesToProjects(entries)
+      const registry = await loadRegistrySource(env);
+      const projects = registry.entries.length > 0
+        ? registryEntriesToProjects(registry.entries)
         : [];
 
       return respond(
-        JSON.stringify({ projects, source: "registry", cached }),
+        JSON.stringify({
+          projects,
+          source: "registry",
+          cached: registry.cached,
+          ...registryAvailabilityFields(registry),
+        }),
         { headers: corsHeaders },
       );
     }
@@ -684,14 +716,15 @@ export async function handleFetch(
         });
       }
 
-      const { entries, cached } = await loadToolsRegistryEntries(env);
-      const tools = searchRegistryTools(entries, query);
+      const registry = await loadToolsRegistryEntries(env);
+      const tools = searchRegistryTools(registry.entries, query);
       return respond(JSON.stringify({
         query,
         count: tools.length,
         tools,
-        cached,
+        cached: registry.cached,
         timestamp: new Date().toISOString(),
+        ...registryAvailabilityFields(registry),
       }), { headers: corsHeaders });
     }
 
@@ -703,14 +736,15 @@ export async function handleFetch(
         });
       }
 
-      const { entries, cached } = await loadToolsRegistryEntries(env);
+      const registry = await loadToolsRegistryEntries(env);
 
       return respond(
         JSON.stringify({
-          tools: entries,
-          count: entries.length,
-          cached,
+          tools: registry.entries,
+          count: registry.entries.length,
+          cached: registry.cached,
           timestamp: new Date().toISOString(),
+          ...registryAvailabilityFields(registry),
         }),
         { headers: corsHeaders },
       );
@@ -733,8 +767,14 @@ export async function handleFetch(
           headers: corsHeaders,
         });
       }
-      const { entries, cached } = await loadToolsRegistryEntries(env);
-      const match = entries.find((entry) => entry.repo.toLowerCase() === rawRepo.toLowerCase());
+      const registry = await loadToolsRegistryEntries(env);
+      if (!registry.available) {
+        return respond(JSON.stringify({ error: registry.error ?? "github_unavailable" }), {
+          status: 503,
+          headers: corsHeaders,
+        });
+      }
+      const match = registry.entries.find((entry) => entry.repo.toLowerCase() === rawRepo.toLowerCase());
       if (!match) {
         return respond(JSON.stringify({ error: "Tool Not Found" }), {
           status: 404,
@@ -744,7 +784,7 @@ export async function handleFetch(
 
       return respond(JSON.stringify({
         tool: match,
-        cached,
+        cached: registry.cached,
         timestamp: new Date().toISOString(),
       }), { headers: corsHeaders });
     }
@@ -769,8 +809,14 @@ export async function handleFetch(
         });
       }
 
-      const entries = await loadRegistryEntries(env);
-      const repos = entries.map((entry) => entry.repo);
+      const registry = await loadRegistrySource(env);
+      if (!registry.available) {
+        return respond(JSON.stringify({ error: registry.error ?? "github_unavailable" }), {
+          status: 503,
+          headers: corsHeaders,
+        });
+      }
+      const repos = registry.entries.map((entry) => entry.repo);
       const payload: RepoTasksPayload[] = await Promise.all(
         repos.map(async (repo) => {
           const loaded = await loadRepoTasks(env, repo);

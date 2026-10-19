@@ -19,6 +19,8 @@ export type FleetHealthPayload = {
   status: FleetHealthStatus;
   repos: FleetRepoHealth[];
   checkedAt: string;
+  /** True when serving expired cache because GitHub could not be refreshed. */
+  stale?: boolean;
 };
 export type FleetTrendDirection = "up" | "down" | "flat" | "unknown";
 type FleetRepoTrend = {
@@ -26,11 +28,17 @@ type FleetRepoTrend = {
   criticality: FleetCriticality;
   last5: string[];
   direction: FleetTrendDirection;
+  /** False when last5 is a failure placeholder, not a genuine empty history. */
+  available?: boolean;
+  error?: string;
 };
 export type FleetTrendPayload = {
   generatedAt: string;
   totalRepos: number;
   repos: FleetRepoTrend[];
+  /** False when the payload is a failure placeholder, not a real empty fleet. */
+  available?: boolean;
+  error?: string;
 };
 export type FleetScorePayload = {
   score: number;
@@ -71,6 +79,14 @@ export type RegistryEntry = {
   criticality: FleetCriticality;
   tier: FleetTier;
   description: string;
+};
+export type RegistryLoadResult = {
+  entries: RegistryEntry[];
+  cached: boolean;
+  available: boolean;
+  /** True when serving the long-TTL stale copy because the live fetch failed. */
+  stale?: boolean;
+  error?: string;
 };
 
 export type TaskPriority = "red" | "yellow" | "green";

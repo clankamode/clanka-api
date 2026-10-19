@@ -6,7 +6,7 @@ import {
   fleetCiCacheKey,
   fleetCiTrendCacheKey,
 } from "./config";
-import { loadRegistryEntries } from "./registry";
+import { loadRegistrySource } from "./registry";
 import type {
   Env,
   FleetCriticality,
@@ -208,11 +208,17 @@ function deriveTrendDirection(conclusions: string[]): FleetTrendDirection {
   return "flat";
 }
 
-async function loadRecentWorkflowConclusions(env: Env, repo: string): Promise<string[]> {
+type TrendConclusions = {
+  conclusions: string[];
+  available: boolean;
+  error?: string;
+};
+
+async function loadRecentWorkflowConclusions(env: Env, repo: string): Promise<TrendConclusions> {
   const cacheKey = fleetCiTrendCacheKey(repo);
   const cached = parseConclusionsCache(await env.CLANKA_STATE.get(cacheKey));
-  if (cached !== null) return cached;
-  if (!env.GITHUB_TOKEN) return [];
+  if (cached !== null) return { conclusions: cached, available: true };
+  if (!env.GITHUB_TOKEN) return { conclusions: [], available: false, error: "no token" };
 
   const headers: Record<string, string> = {
     "User-Agent": "clanka-api/1.0",
@@ -222,14 +228,14 @@ async function loadRecentWorkflowConclusions(env: Env, repo: string): Promise<st
   try {
     const runListUrl = `https://api.github.com/repos/${repo}/actions/runs?per_page=5`;
     const res = await fetch(runListUrl, { headers });
-    if (!res.ok) return [];
+    if (!res.ok) return { conclusions: [], available: false, error: "github_unavailable" };
 
     const body = await res.json() as { workflow_runs?: unknown };
     if (!Array.isArray(body.workflow_runs) || body.workflow_runs.length === 0) {
       await env.CLANKA_STATE.put(cacheKey, JSON.stringify([]), {
         expirationTtl: FLEET_CI_TTL_SEC,
       });
-      return [];
+      return { conclusions: [], available: true };
     }
 
     const conclusions = body.workflow_runs
@@ -241,9 +247,9 @@ async function loadRecentWorkflowConclusions(env: Env, repo: string): Promise<st
     await env.CLANKA_STATE.put(cacheKey, JSON.stringify(conclusions), {
       expirationTtl: FLEET_CI_TTL_SEC,
     });
-    return conclusions;
+    return { conclusions, available: true };
   } catch {
-    return [];
+    return { conclusions: [], available: false, error: "github_unavailable" };
   }
 }
 
@@ -308,7 +314,11 @@ function toFleetRepoHealth(
 }
 
 export async function loadFleetHealthFromGithub(env: Env): Promise<FleetHealthPayload> {
-  const registryEntries = await loadRegistryEntries(env);
+  const registry = await loadRegistrySource(env);
+  if (!registry.available) {
+    throw new Error(registry.error ?? "github_unavailable");
+  }
+  const registryEntries = registry.entries;
   const hasGithubToken = typeof env.GITHUB_TOKEN === "string" && env.GITHUB_TOKEN.trim().length > 0;
   const repos = await Promise.all(
     registryEntries.map(async (entry) => {
@@ -330,24 +340,39 @@ export async function loadFleetHealthFromGithub(env: Env): Promise<FleetHealthPa
 }
 
 export async function loadFleetTrendFromGithub(env: Env): Promise<FleetTrendPayload> {
-  const registryEntries = await loadRegistryEntries(env);
+  const registry = await loadRegistrySource(env);
+  if (!registry.available) {
+    return {
+      generatedAt: new Date().toISOString(),
+      totalRepos: 0,
+      repos: [],
+      available: false,
+      error: registry.error ?? "github_unavailable",
+    };
+  }
+
   const repos = await Promise.all(
-    registryEntries.map(async (entry) => {
-      const last5 = await loadRecentWorkflowConclusions(env, entry.repo);
+    registry.entries.map(async (entry) => {
+      const loaded = await loadRecentWorkflowConclusions(env, entry.repo);
       return {
         repo: entry.repo,
         criticality: entry.criticality,
-        last5,
-        direction: deriveTrendDirection(last5),
+        last5: loaded.conclusions,
+        direction: deriveTrendDirection(loaded.conclusions),
+        available: loaded.available,
+        ...(loaded.error ? { error: loaded.error } : {}),
       };
     }),
   );
   repos.sort((a, b) => a.repo.localeCompare(b.repo));
 
+  const unavailable = repos.find((repo) => repo.available === false);
   return {
     generatedAt: new Date().toISOString(),
     totalRepos: repos.length,
     repos,
+    available: !unavailable,
+    ...(unavailable?.error ? { error: unavailable.error } : {}),
   };
 }
 
@@ -358,7 +383,7 @@ function fleetScoreValue(status: FleetHealthStatus): number {
   return 40;
 }
 
-export async function loadFleetScorePayload(env: Env): Promise<FleetScorePayload> {
+export async function loadFleetScorePayload(env: Env): Promise<FleetScorePayload | null> {
   let health = parseFleetHealthPayload(await env.CLANKA_STATE.get(FLEET_HEALTH_CACHE_KEY));
 
   if (!health || !isFleetHealthFresh(health)) {
@@ -366,14 +391,12 @@ export async function loadFleetScorePayload(env: Env): Promise<FleetScorePayload
       health = await loadFleetHealthFromGithub(env);
     } catch {
       if (!health) {
-        health = {
-          status: "UNKNOWN",
-          repos: [],
-          checkedAt: new Date().toISOString(),
-        };
+        return null;
       }
     }
   }
+
+  if (!health) return null;
 
   const statuses = health.repos.map((repo) => deriveRepoHealthStatus(repo));
   const healthyRepos = statuses.filter((status) => status === "GREEN").length;

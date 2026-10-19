@@ -187,8 +187,11 @@ export const OPENAPI_SPEC = {
                     },
                     source: { type: "string" },
                     cached: { type: "boolean" },
+                    available: { type: "boolean" },
+                    stale: { type: "boolean" },
+                    error: { type: "string" },
                   },
-                  required: ["projects", "source", "cached"],
+                  required: ["projects", "source", "cached", "available"],
                 },
               },
             },
@@ -226,8 +229,11 @@ export const OPENAPI_SPEC = {
                     count: { type: "number" },
                     cached: { type: "boolean" },
                     timestamp: { type: "string" },
+                    available: { type: "boolean" },
+                    stale: { type: "boolean" },
+                    error: { type: "string" },
                   },
-                  required: ["tools", "count", "cached", "timestamp"],
+                  required: ["tools", "count", "cached", "timestamp", "available"],
                 },
               },
             },
@@ -278,6 +284,9 @@ export const OPENAPI_SPEC = {
           "404": {
             description: "Tool not found",
           },
+          "503": {
+            description: "Registry unavailable; not the same as a missing tool",
+          },
           "429": {
             description: "Too Many Requests",
           },
@@ -319,6 +328,9 @@ export const OPENAPI_SPEC = {
               },
             },
           },
+          "503": {
+            description: "Registry unavailable; cannot list repos to read TASKS.md from",
+          },
           "429": {
             description: "Too Many Requests",
           },
@@ -351,6 +363,7 @@ export const OPENAPI_SPEC = {
                       },
                     },
                     checkedAt: { type: "string" },
+                    stale: { type: "boolean", description: "True when serving expired cache because GitHub could not be refreshed" },
                   },
                   required: ["status", "repos", "checkedAt"],
                 },
@@ -391,15 +404,52 @@ export const OPENAPI_SPEC = {
                             items: { type: "string" },
                           },
                           direction: { type: "string", enum: ["up", "down", "flat", "unknown"] },
+                          available: { type: "boolean" },
+                          error: { type: "string" },
                         },
                         required: ["repo", "criticality", "last5", "direction"],
                       },
                     },
+                    available: { type: "boolean" },
+                    error: { type: "string" },
                   },
                   required: ["generatedAt", "totalRepos", "repos"],
                 },
               },
             },
+          },
+          "429": {
+            description: "Too Many Requests",
+          },
+        },
+      },
+    },
+    "/fleet/score": {
+      get: {
+        summary: "Get aggregate fleet health score",
+        responses: {
+          "200": {
+            description: "Fleet score derived from cached or live health",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    score: { type: "number" },
+                    status: { type: "string", enum: ["GREEN", "YELLOW", "RED", "UNKNOWN"] },
+                    totalRepos: { type: "number" },
+                    healthyRepos: { type: "number" },
+                    degradedRepos: { type: "number" },
+                    unknownRepos: { type: "number" },
+                    timestamp: { type: "string" },
+                  },
+                  required: ["score", "status", "totalRepos", "healthyRepos", "degradedRepos", "unknownRepos", "timestamp"],
+                },
+              },
+            },
+          },
+          "503": {
+            description: "Fleet health cannot be loaded (no cache and GitHub unavailable)",
           },
           "429": {
             description: "Too Many Requests",

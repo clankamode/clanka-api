@@ -6,7 +6,7 @@ Edge API for Clanka's public presence surface. Cloudflare Worker + KV.
 - TypeScript
 - Cloudflare Workers (wrangler)
 - KV namespace: `CLANKA_STATE`
-- Secrets: `ADMIN_KEY`, `GITHUB_TOKEN`
+- Secrets: `ADMIN_KEY`, `ADMIN_TOKEN`, `GITHUB_TOKEN`
 
 ## Dev Workflow
 ```bash
@@ -16,8 +16,8 @@ npx wrangler deploy       # deploy to prod
 ```
 
 ## Key Patterns
-- All handlers live in `src/index.ts` — single file worker
-- Public endpoints: no auth. Admin endpoints: `Authorization: Bearer <ADMIN_KEY>`
+- Handlers live in `src/router.ts`; `src/index.ts` re-exports `fetch`
+- Public endpoints: no auth. Admin write endpoints: `Authorization: Bearer <ADMIN_KEY>`. `/metrics` and `/admin/refresh` use `ADMIN_TOKEN`.
 - KV cache pattern: check KV first (key + TTL), fetch on miss, write back
 - `GITHUB_TOKEN` used for private GitHub API calls (registry fetch)
 - Registry fetched from `clankamode/assistant-tool-registry` via GitHub API, cached 1hr in KV
